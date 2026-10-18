@@ -232,6 +232,8 @@ type UDPReader struct {
 	reader   io.Reader
 	df       *Defragger
 	firstBuf *buf.Buffer
+	lastAddr string
+	lastDest net.Destination
 }
 
 func (r *UDPReader) ReadFrom(p []byte) (n int, addr *net.Destination, err error) {
@@ -247,28 +249,37 @@ func (r *UDPReader) ReadFrom(p []byte) (n int, addr *net.Destination, err error)
 			return 0, nil, err
 		}
 
-		msg, err := ParseUDPMessage(readBuf[:n])
-		if err != nil {
-			continue
-		}
-		if msg.FragCount > 1 {
-			msg.Data = append([]byte(nil), msg.Data...)
-		}
-
-		dfMsg := r.df.Feed(msg)
-		if dfMsg == nil {
+		message := UDPMessage{Addr: r.lastAddr}
+		if err := parseUDPMessage(readBuf[:n], &message); err != nil {
 			continue
 		}
 
-		dest, err := net.ParseDestination("udp:" + dfMsg.Addr)
-		if err != nil {
-			continue
+		dfMsg := &message
+		if dfMsg.FragCount > 1 {
+			// Fragments outlive the next read and need their own metadata and payload.
+			fragment := message
+			fragment.Data = append([]byte(nil), fragment.Data...)
+			dfMsg = r.df.Feed(&fragment)
+			if dfMsg == nil {
+				continue
+			}
+		}
+
+		if r.lastAddr != dfMsg.Addr {
+			dest, err := net.ParseDestination("udp:" + dfMsg.Addr)
+			if err != nil {
+				continue
+			}
+			r.lastAddr = dfMsg.Addr
+			r.lastDest = dest
 		}
 
 		if len(p) < len(dfMsg.Data) {
 			continue
 		}
 
+		// Downstream address overrides may mutate the returned destination.
+		dest := r.lastDest
 		return copy(p, dfMsg.Data), &dest, nil
 	}
 }

@@ -182,30 +182,39 @@ func (m *UDPMessage) Serialize(buf []byte) int {
 }
 
 func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
-	if len(msg) < 9 {
-		return nil, io.ErrUnexpectedEOF
-	}
-	m := &UDPMessage{
-		SessionID: binary.BigEndian.Uint32(msg[:4]),
-		PacketID:  binary.BigEndian.Uint16(msg[4:6]),
-		FragID:    msg[6],
-		FragCount: msg[7],
-	}
-	lAddr, n, err := quicvarint.Parse(msg[8:])
-	if err != nil {
+	m := new(UDPMessage)
+	if err := parseUDPMessage(msg, m); err != nil {
 		return nil, err
 	}
+	return m, nil
+}
+
+func parseUDPMessage(msg []byte, m *UDPMessage) error {
+	if len(msg) < 9 {
+		return io.ErrUnexpectedEOF
+	}
+	m.SessionID = binary.BigEndian.Uint32(msg[:4])
+	m.PacketID = binary.BigEndian.Uint16(msg[4:6])
+	m.FragID = msg[6]
+	m.FragCount = msg[7]
+	lAddr, n, err := quicvarint.Parse(msg[8:])
+	if err != nil {
+		return err
+	}
 	if lAddr == 0 || lAddr > MaxMessageLength {
-		return nil, errors.New("invalid address length")
+		return errors.New("invalid address length")
 	}
 	offset := 8 + n
 	if len(msg)-offset <= int(lAddr) {
 		// We use <= instead of < here as we expect at least one byte of data after the address
-		return nil, errors.New("invalid message length")
+		return errors.New("invalid message length")
 	}
-	m.Addr = string(msg[offset : offset+int(lAddr)])
+	addr := msg[offset : offset+int(lAddr)]
+	if m.Addr != string(addr) {
+		m.Addr = string(addr)
+	}
 	m.Data = msg[offset+int(lAddr):]
-	return m, nil
+	return nil
 }
 
 // varintPut is like quicvarint.Append, but instead of appending to a slice,

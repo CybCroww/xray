@@ -214,15 +214,16 @@ func (m *udpSessionManager) clean() {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		m.RLock()
 		if m.closed {
+			m.RUnlock()
 			return
 		}
 
-		m.RLock()
-		now := time.Now()
-		timeoutConn := make([]*InterConn, 0, len(m.m))
+		deadline := time.Now().Add(-m.udpIdleTimeout).UnixNano()
+		var timeoutConn []*InterConn
 		for _, udpConn := range m.m {
-			if now.Sub(udpConn.Time()) > m.udpIdleTimeout {
+			if udpConn.lastSeen.Load() < deadline {
 				timeoutConn = append(timeoutConn, udpConn)
 			}
 		}
@@ -230,7 +231,9 @@ func (m *udpSessionManager) clean() {
 
 		for _, udpConn := range timeoutConn {
 			m.Lock()
-			m.close(udpConn)
+			if udpConn.lastSeen.Load() < deadline {
+				m.close(udpConn)
+			}
 			m.Unlock()
 		}
 	}
