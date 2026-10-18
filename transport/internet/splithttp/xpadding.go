@@ -47,19 +47,21 @@ func randStringFromCharset(n int, charset string) (string, bool) {
 	m := len(charset)
 	limit := byte(256 - (256 % m))
 
-	result := make([]byte, n)
+	var result strings.Builder
+	result.Grow(n)
 	i := 0
 
-	var buf [256]byte
+	var buf [1024]byte
 	for i < n {
-		if _, err := rand.Read(buf[:]); err != nil {
+		randomBytes := buf[:min(len(buf), n-i+(n-i)/8+1)]
+		if _, err := rand.Read(randomBytes); err != nil {
 			return "", false
 		}
-		for _, rb := range buf {
+		for _, rb := range randomBytes {
 			if rb >= limit {
 				continue
 			}
-			result[i] = charset[int(rb)%m]
+			result.WriteByte(charset[int(rb)%m])
 			i++
 			if i == n {
 				break
@@ -67,7 +69,7 @@ func randStringFromCharset(n int, charset string) (string, bool) {
 		}
 	}
 
-	return string(result), true
+	return result.String(), true
 }
 
 func absInt(x int) int {
@@ -92,7 +94,7 @@ func GenerateTokenishPaddingBase62(targetHuffmanBytes int) string {
 	adjustChar := byte('X')
 
 	// Adjust until close enough
-	for iter := 0; iter < maxIter; iter++ {
+	for iter := 0; iter < maxIter; {
 		currentLength := int(hpack.HuffmanEncodeLength(randBase62Str))
 		diff := currentLength - targetHuffmanBytes
 
@@ -100,23 +102,29 @@ func GenerateTokenishPaddingBase62(targetHuffmanBytes int) string {
 			return randBase62Str
 		}
 
+		adjustments := min(absInt(diff)-validationTolerance, maxIter-iter)
 		if diff < 0 {
-			// Too small -> append padding char(s)
-			randBase62Str += string(adjustChar)
-
-			// Avoid a long run of identical chars
-			if adjustChar == 'X' {
-				adjustChar = 'Z'
-			} else {
-				adjustChar = 'X'
+			var builder strings.Builder
+			builder.Grow(len(randBase62Str) + adjustments)
+			builder.WriteString(randBase62Str)
+			for range adjustments {
+				builder.WriteByte(adjustChar)
+				if adjustChar == 'X' {
+					adjustChar = 'Z'
+				} else {
+					adjustChar = 'X'
+				}
 			}
+			randBase62Str = builder.String()
 		} else {
-			// Too big -> remove from the end
 			if len(randBase62Str) <= 1 {
 				return randBase62Str
 			}
-			randBase62Str = randBase62Str[:len(randBase62Str)-1]
+			// Base62 symbols use at most eight Huffman bits, so this cannot overshoot.
+			adjustments = min(adjustments, len(randBase62Str)-1)
+			randBase62Str = randBase62Str[:len(randBase62Str)-adjustments]
 		}
+		iter += adjustments
 	}
 
 	return randBase62Str

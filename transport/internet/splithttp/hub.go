@@ -68,11 +68,13 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 		uploadQueue: NewUploadQueue(h.ln.config.GetNormalizedScMaxBufferedPosts()),
 	}
 
-	h.sessions.Store(sessionId, s)
 	s.reapTimer = time.AfterFunc(30*time.Second, func() {
-		h.sessions.Delete(sessionId)
+		h.sessionMu.Lock()
+		h.sessions.CompareAndDelete(sessionId, s)
+		h.sessionMu.Unlock()
 		s.uploadQueue.Close()
 	})
+	h.sessions.Store(sessionId, s)
 
 	return s
 }
@@ -141,26 +143,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		return
 	}
 
-	var remoteAddr net.Addr
 	var err error
-	remoteAddr, err = net.ResolveTCPAddr("tcp", request.RemoteAddr)
-	if err != nil {
-		remoteAddr = &net.TCPAddr{
-			IP:   []byte{0, 0, 0, 0},
-			Port: 0,
-		}
-	}
-	if request.ProtoMajor == 3 {
-		remoteAddr = &net.UDPAddr{
-			IP:   remoteAddr.(*net.TCPAddr).IP,
-			Port: remoteAddr.(*net.TCPAddr).Port,
-		}
-	}
-	var trustedXFF []string
-	if h.socketSettings != nil {
-		trustedXFF = h.socketSettings.TrustedXForwardedFor
-	}
-	remoteAddr = http_proto.ApplyTrustedXForwardedFor(request.Header, trustedXFF, remoteAddr)
 
 	var currentSession *httpSession
 	if sessionId != "" {
@@ -323,11 +306,31 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 		writer.WriteHeader(http.StatusOK)
 	} else if request.Method == "GET" || sessionId == "" { // stream-down, stream-one
+		var remoteAddr net.Addr
+		remoteAddr, err = net.ResolveTCPAddr("tcp", request.RemoteAddr)
+		if err != nil {
+			remoteAddr = &net.TCPAddr{
+				IP:   []byte{0, 0, 0, 0},
+				Port: 0,
+			}
+		}
+		if request.ProtoMajor == 3 {
+			remoteAddr = &net.UDPAddr{
+				IP:   remoteAddr.(*net.TCPAddr).IP,
+				Port: remoteAddr.(*net.TCPAddr).Port,
+			}
+		}
+		var trustedXFF []string
+		if h.socketSettings != nil {
+			trustedXFF = h.socketSettings.TrustedXForwardedFor
+		}
+		remoteAddr = http_proto.ApplyTrustedXForwardedFor(request.Header, trustedXFF, remoteAddr)
+
 		if sessionId != "" {
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
 			currentSession.reapTimer.Stop()
-			defer h.sessions.Delete(sessionId)
+			defer h.sessions.CompareAndDelete(sessionId, currentSession)
 		}
 
 		// magic header instructs nginx + apache to not buffer response body
@@ -383,13 +386,15 @@ func collectIndexedHeaderValues(header http.Header, prefix string) string {
 	if prefix == "" {
 		return ""
 	}
-	var chunks []string
+	var initial [8]string
+	chunks := initial[:0]
 	for key, values := range header {
 		if len(values) == 0 || len(key) <= len(prefix) || !strings.EqualFold(key[:len(prefix)], prefix) {
 			continue
 		}
 		index, err := strconv.Atoi(key[len(prefix):])
-		if err != nil || index < 0 {
+		// A contiguous payload cannot contain more chunks than there are headers.
+		if err != nil || index < 0 || index >= len(header) {
 			continue
 		}
 		chunks = ensureIndexedChunk(chunks, index)
@@ -402,13 +407,15 @@ func collectIndexedCookieValues(request *http.Request, prefix string) string {
 	if prefix == "" {
 		return ""
 	}
-	var chunks []string
-	for _, cookie := range request.Cookies() {
+	var initial [8]string
+	chunks := initial[:0]
+	cookies := request.Cookies()
+	for _, cookie := range cookies {
 		if len(cookie.Name) <= len(prefix) || !strings.HasPrefix(cookie.Name, prefix) {
 			continue
 		}
 		index, err := strconv.Atoi(cookie.Name[len(prefix):])
-		if err != nil || index < 0 {
+		if err != nil || index < 0 || index >= len(cookies) {
 			continue
 		}
 		chunks = ensureIndexedChunk(chunks, index)
@@ -427,6 +434,9 @@ func ensureIndexedChunk(chunks []string, index int) []string {
 func joinIndexedChunks(chunks []string) string {
 	if len(chunks) == 0 || chunks[0] == "" {
 		return ""
+	}
+	if len(chunks) == 1 || chunks[1] == "" {
+		return chunks[0]
 	}
 	total := 0
 	for _, chunk := range chunks {

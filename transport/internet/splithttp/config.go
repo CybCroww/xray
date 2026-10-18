@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -403,20 +404,20 @@ func (c *Config) ExtractMetaFromRequest(req *http.Request, path string) (session
 	sessionKey := c.GetNormalizedSessionKey()
 	seqKey := c.GetNormalizedSeqKey()
 
-	var subpath []string
-	pathPart := 0
+	var subpath string
 	if sessionPlacement == PlacementPath || seqPlacement == PlacementPath {
-		subpath = strings.Split(req.URL.Path[len(path):], "/")
+		subpath = req.URL.Path[len(path):]
+	}
+	var query url.Values
+	if sessionPlacement == PlacementQuery || seqPlacement == PlacementQuery {
+		query = req.URL.Query()
 	}
 
 	switch sessionPlacement {
 	case PlacementPath:
-		if len(subpath) > pathPart {
-			sessionId = subpath[pathPart]
-			pathPart += 1
-		}
+		sessionId, subpath, _ = strings.Cut(subpath, "/")
 	case PlacementQuery:
-		sessionId = req.URL.Query().Get(sessionKey)
+		sessionId = query.Get(sessionKey)
 	case PlacementHeader:
 		sessionId = req.Header.Get(sessionKey)
 	case PlacementCookie:
@@ -427,12 +428,9 @@ func (c *Config) ExtractMetaFromRequest(req *http.Request, path string) (session
 
 	switch seqPlacement {
 	case PlacementPath:
-		if len(subpath) > pathPart {
-			seqStr = subpath[pathPart]
-			pathPart += 1
-		}
+		seqStr, _, _ = strings.Cut(subpath, "/")
 	case PlacementQuery:
-		seqStr = req.URL.Query().Get(seqKey)
+		seqStr = query.Get(seqKey)
 	case PlacementHeader:
 		seqStr = req.Header.Get(seqKey)
 	case PlacementCookie:
