@@ -288,6 +288,18 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 func init() {
 	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		for range ticker.C {
+			globalDialerAccess.Lock()
+			for key, manager := range globalDialerMap {
+				if !manager.HasActiveClients() {
+					delete(globalDialerMap, key)
+				}
+			}
+			globalDialerAccess.Unlock()
+		}
+	}()
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
@@ -540,37 +552,31 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	return stat.Connection(&conn), nil
 }
 
-// A wrapper around pipe that ensures the size limit is exactly honored.
-//
-// The MultiBuffer pipe accepts any single WriteMultiBuffer call even if that
-// single MultiBuffer exceeds the size limit, and then starts blocking on the
-// next WriteMultiBuffer call. This means that ReadMultiBuffer can return more
-// bytes than the size limit. We work around this by splitting a potentially
-// too large write up into multiple.
+// The pipe admits one write beyond its size limit, so bound each batch before
+// allocating buffers. The upload reader splits the result into exact packets.
 type uploadWriter struct {
 	*pipe.Writer
 	maxLen int32
 }
 
 func (w uploadWriter) Write(b []byte) (int, error) {
-	/*
-		capacity := int(w.maxLen - w.Len())
-		if capacity > 0 && capacity < len(b) {
-			b = b[:capacity]
-		}
-	*/
-
-	buffer := buf.MultiBufferContainer{}
-	common.Must2(buffer.Write(b))
-
-	var writed int
-	for _, buff := range buffer.MultiBuffer {
-		n := int(buff.Len())
-		err := w.WriteMultiBuffer(buf.MultiBuffer{buff})
-		if err != nil {
-			return writed, err
-		}
-		writed += n
+	if len(b) == 0 {
+		return 0, nil
 	}
-	return writed, nil
+	if w.maxLen <= 0 {
+		return 0, errors.New("upload batch size must be positive")
+	}
+	written := 0
+	for len(b) > 0 {
+		n := min(len(b), int(w.maxLen))
+		buffer := buf.MultiBufferContainer{}
+		common.Must2(buffer.Write(b[:n]))
+		// WriteMultiBuffer takes ownership on both success and failure.
+		if err := w.WriteMultiBuffer(buffer.MultiBuffer); err != nil {
+			return written, err
+		}
+		written += n
+		b = b[n:]
+	}
+	return written, nil
 }

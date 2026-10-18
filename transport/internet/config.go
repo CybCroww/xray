@@ -1,10 +1,36 @@
 package internet
 
 import (
+	"strconv"
+	"strings"
+
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 )
+
+const (
+	minTcpBrutalRate = 62500
+	minTcpBrutalGain = 5
+	maxTcpBrutalGain = 80
+)
+
+// ParseBrutalParams validates the packed v1 TCP Brutal socket option.
+func ParseBrutalParams(value string) (uint64, uint32, error) {
+	rateValue, gainValue, ok := strings.Cut(value, ",")
+	if !ok {
+		return 0, 0, errors.New("invalid brutalParams: expected rate,cwnd_gain")
+	}
+	rate, err := strconv.ParseUint(rateValue, 10, 64)
+	if err != nil || rate < minTcpBrutalRate {
+		return 0, 0, errors.New("invalid TCP Brutal rate: must be at least 62500 bytes/s").Base(err)
+	}
+	gain, err := strconv.ParseUint(gainValue, 10, 32)
+	if err != nil || gain < minTcpBrutalGain || gain > maxTcpBrutalGain {
+		return 0, 0, errors.New("invalid TCP Brutal cwnd_gain: must be between 5 and 80").Base(err)
+	}
+	return rate, uint32(gain), nil
+}
 
 type ConfigCreator func() interface{}
 

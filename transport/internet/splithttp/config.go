@@ -3,15 +3,14 @@ package splithttp
 import (
 	"bytes"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/transport/internet"
@@ -72,7 +71,7 @@ func (c *Config) GetRequestHeaderWithPayload(payload []byte) http.Header {
 		chunkSize := min(int(c.GetNormalizedUplinkChunkSize().rand()), len(encodedData))
 		chunk := encodedData[:chunkSize]
 		encodedData = encodedData[chunkSize:]
-		headerKey := fmt.Sprintf("%s-%d", key, i)
+		headerKey := key + "-" + strconv.Itoa(i)
 		header.Set(headerKey, chunk)
 	}
 
@@ -89,7 +88,7 @@ func (c *Config) GetRequestCookiesWithPayload(payload []byte) []*http.Cookie {
 		chunkSize := min(int(c.GetNormalizedUplinkChunkSize().rand()), len(encodedData))
 		chunk := encodedData[:chunkSize]
 		encodedData = encodedData[chunkSize:]
-		cookieName := fmt.Sprintf("%s_%d", key, i)
+		cookieName := key + "_" + strconv.Itoa(i)
 		cookies = append(cookies, &http.Cookie{Name: cookieName, Value: chunk})
 	}
 
@@ -354,6 +353,12 @@ func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqS
 		}
 	}
 
+	c.applyPacketRequestControls(request, sessionId, seqStr)
+
+	return nil
+}
+
+func (c *Config) applyPacketRequestControls(request *http.Request, sessionId string, seqStr string) {
 	length := int(c.GetNormalizedXPaddingBytes().rand())
 	config := XPaddingConfig{Length: length}
 
@@ -376,8 +381,20 @@ func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqS
 
 	c.ApplyXPaddingToRequest(request, config)
 	c.ApplyMetaToRequest(request, sessionId, seqStr)
+}
 
-	return nil
+type multiBufferBody struct {
+	buf.MultiBufferContainer
+}
+
+func newMultiBufferBody(payload buf.MultiBuffer) io.ReadCloser {
+	return &multiBufferBody{
+		MultiBufferContainer: buf.MultiBufferContainer{MultiBuffer: payload},
+	}
+}
+
+func (b *multiBufferBody) Close() error {
+	return b.MultiBufferContainer.Close()
 }
 
 func (c *Config) ExtractMetaFromRequest(req *http.Request, path string) (sessionId string, seqStr string) {
@@ -492,7 +509,13 @@ func (c *RangeConfig) rand() int32 {
 	if c == nil {
 		return 0
 	}
-	return int32(crypto.RandBetween(int64(c.From), int64(c.To)))
+	if c.From == c.To {
+		return c.From
+	}
+	if c.From > c.To {
+		return c.From
+	}
+	return int32(int64(c.From) + rand.Int64N(int64(c.To)-int64(c.From)+1))
 }
 
 // predefined

@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	gotls "crypto/tls"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"net/http"
 	"runtime"
@@ -46,11 +45,7 @@ type requestHandler struct {
 
 type httpSession struct {
 	uploadQueue *uploadQueue
-	// for as long as the GET request is not opened by the client, this will be
-	// open ("undone"), and the session may be expired within a certain TTL.
-	// after the client connects, this becomes "done" and the session lives as
-	// long as the GET request.
-	isFullyConnected *done.Instance
+	reapTimer   *time.Timer
 }
 
 func (h *requestHandler) upsertSession(sessionId string) *httpSession {
@@ -70,25 +65,14 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 	}
 
 	s := &httpSession{
-		uploadQueue:      NewUploadQueue(h.ln.config.GetNormalizedScMaxBufferedPosts()),
-		isFullyConnected: done.New(),
+		uploadQueue: NewUploadQueue(h.ln.config.GetNormalizedScMaxBufferedPosts()),
 	}
 
 	h.sessions.Store(sessionId, s)
-
-	shouldReap := done.New()
-	go func() {
-		time.Sleep(30 * time.Second)
-		shouldReap.Close()
-	}()
-	go func() {
-		select {
-		case <-shouldReap.Wait():
-			h.sessions.Delete(sessionId)
-			s.uploadQueue.Close()
-		case <-s.isFullyConnected.Wait():
-		}
-	}()
+	s.reapTimer = time.AfterFunc(30*time.Second, func() {
+		h.sessions.Delete(sessionId)
+		s.uploadQueue.Close()
+	})
 
 	return s
 }
@@ -247,15 +231,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		dataPlacement := h.config.GetNormalizedUplinkDataPlacement()
 		var headerPayload []byte
 		if dataPlacement == PlacementAuto || dataPlacement == PlacementHeader {
-			var headerPayloadChunks []string
-			for i := 0; true; i++ {
-				chunk := request.Header.Get(fmt.Sprintf("%s-%d", uplinkDataKey, i))
-				if chunk == "" {
-					break
-				}
-				headerPayloadChunks = append(headerPayloadChunks, chunk)
-			}
-			headerPayloadEncoded := strings.Join(headerPayloadChunks, "")
+			headerPayloadEncoded := collectIndexedHeaderValues(request.Header, uplinkDataKey+"-")
 			headerPayload, err = base64.RawURLEncoding.DecodeString(headerPayloadEncoded)
 			if err != nil {
 				errors.LogInfo(context.Background(), "Invalid base64 in header's payload: ", err.Error())
@@ -266,16 +242,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 		var cookiePayload []byte
 		if dataPlacement == PlacementAuto || dataPlacement == PlacementCookie {
-			var cookiePayloadChunks []string
-			for i := 0; true; i++ {
-				cookieName := fmt.Sprintf("%s_%d", uplinkDataKey, i)
-				if c, _ := request.Cookie(cookieName); c != nil {
-					cookiePayloadChunks = append(cookiePayloadChunks, c.Value)
-				} else {
-					break
-				}
-			}
-			cookiePayloadEncoded := strings.Join(cookiePayloadChunks, "")
+			cookiePayloadEncoded := collectIndexedCookieValues(request, uplinkDataKey+"_")
 			cookiePayload, err = base64.RawURLEncoding.DecodeString(cookiePayloadEncoded)
 			if err != nil {
 				errors.LogInfo(context.Background(), "Invalid base64 in cookies' payload: ", err.Error())
@@ -314,7 +281,16 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		case PlacementBody:
 			payload = bodyPayload
 		case PlacementAuto:
-			payload = slices.Concat(headerPayload, cookiePayload, bodyPayload)
+			switch {
+			case len(headerPayload) > 0 && len(cookiePayload) == 0 && len(bodyPayload) == 0:
+				payload = headerPayload
+			case len(headerPayload) == 0 && len(cookiePayload) > 0 && len(bodyPayload) == 0:
+				payload = cookiePayload
+			case len(headerPayload) == 0 && len(cookiePayload) == 0:
+				payload = bodyPayload
+			default:
+				payload = slices.Concat(headerPayload, cookiePayload, bodyPayload)
+			}
 		}
 
 		if len(payload) > scMaxEachPostBytes {
@@ -350,7 +326,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		if sessionId != "" {
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
-			currentSession.isFullyConnected.Close()
+			currentSession.reapTimer.Stop()
 			defer h.sessions.Delete(sessionId)
 		}
 
@@ -401,6 +377,73 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		errors.LogInfo(context.Background(), "unsupported method: ", request.Method)
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func collectIndexedHeaderValues(header http.Header, prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	var chunks []string
+	for key, values := range header {
+		if len(values) == 0 || len(key) <= len(prefix) || !strings.EqualFold(key[:len(prefix)], prefix) {
+			continue
+		}
+		index, err := strconv.Atoi(key[len(prefix):])
+		if err != nil || index < 0 {
+			continue
+		}
+		chunks = ensureIndexedChunk(chunks, index)
+		chunks[index] = values[0]
+	}
+	return joinIndexedChunks(chunks)
+}
+
+func collectIndexedCookieValues(request *http.Request, prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	var chunks []string
+	for _, cookie := range request.Cookies() {
+		if len(cookie.Name) <= len(prefix) || !strings.HasPrefix(cookie.Name, prefix) {
+			continue
+		}
+		index, err := strconv.Atoi(cookie.Name[len(prefix):])
+		if err != nil || index < 0 {
+			continue
+		}
+		chunks = ensureIndexedChunk(chunks, index)
+		chunks[index] = cookie.Value
+	}
+	return joinIndexedChunks(chunks)
+}
+
+func ensureIndexedChunk(chunks []string, index int) []string {
+	if index < len(chunks) {
+		return chunks
+	}
+	return append(chunks, make([]string, index-len(chunks)+1)...)
+}
+
+func joinIndexedChunks(chunks []string) string {
+	if len(chunks) == 0 || chunks[0] == "" {
+		return ""
+	}
+	total := 0
+	for _, chunk := range chunks {
+		if chunk == "" {
+			break
+		}
+		total += len(chunk)
+	}
+	var builder strings.Builder
+	builder.Grow(total)
+	for _, chunk := range chunks {
+		if chunk == "" {
+			break
+		}
+		builder.WriteString(chunk)
+	}
+	return builder.String()
 }
 
 type httpServerConn struct {

@@ -1,0 +1,29 @@
+name: Prepare verified assets
+description: Download the upstream geodata and optional Wintun without requiring a warm cache.
+inputs:
+  wintun:
+    description: Include the pinned Wintun distribution used by Windows releases.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Download and verify geodata
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p resources
+        for asset in geoip.dat geosite.dat; do
+          base="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release"
+          curl --fail --show-error --silent --location --retry 3 "$base/$asset.sha256sum" -o "resources/$asset.sha256sum"
+          curl --fail --show-error --silent --location --retry 3 "$base/$asset" -o "resources/$asset"
+          (cd resources && sha256sum --check "$asset.sha256sum")
+        done
+    - name: Download and verify Wintun
+      if: inputs.wintun == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl --fail --show-error --silent --location --retry 3 https://www.wintun.net/builds/wintun-0.14.1.zip -o wintun.zip
+        echo '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51  wintun.zip' | sha256sum --check
+        unzip -q wintun.zip -d resources
+        rm wintun.zip

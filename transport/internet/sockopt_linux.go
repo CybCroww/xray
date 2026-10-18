@@ -2,6 +2,7 @@ package internet
 
 import (
 	"context"
+	"encoding/binary"
 	"runtime"
 	"strconv"
 	"strings"
@@ -10,6 +11,26 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"golang.org/x/sys/unix"
 )
+
+const tcpBrutalParams = 23301
+
+func setTcpBrutal(fd uintptr, rate uint64, cwndGain uint32) error {
+	var value [12]byte
+	binary.NativeEndian.PutUint64(value[:8], rate)
+	binary.NativeEndian.PutUint32(value[8:], cwndGain)
+	return unix.SetsockoptString(int(fd), unix.IPPROTO_TCP, tcpBrutalParams, string(value[:]))
+}
+
+func applyTcpBrutal(fd uintptr, value string) error {
+	rate, gain, err := ParseBrutalParams(value)
+	if err != nil {
+		return err
+	}
+	if err := setTcpBrutal(fd, rate, gain); err != nil {
+		return errors.New("failed to set TCP_BRUTAL_PARAMS").Base(err)
+	}
+	return nil
+}
 
 // applyOutboundSocketOptions applies socket options for outbound connection.
 // note that unlike other part of Xray, this function needs network with speified network stack(tcp4/tcp6/udp4/udp6)
@@ -40,6 +61,12 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 		if config.TcpCongestion != "" {
 			if err := syscall.SetsockoptString(int(fd), syscall.SOL_TCP, syscall.TCP_CONGESTION, config.TcpCongestion); err != nil {
 				return errors.New("failed to set TCP_CONGESTION", err)
+			}
+		}
+
+		if config.BrutalParams != "" {
+			if err := applyTcpBrutal(fd, config.BrutalParams); err != nil {
+				return err
 			}
 		}
 
@@ -74,6 +101,12 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 			// use HasPrefix so that "tcp" can match tcp4/6 with "tcp" if user want to control all tcp (udp is also the same)
 			// if it is empty, strings.HasPrefix will always return true to make it apply for all networks
 			if !strings.HasPrefix(network, custom.Network) {
+				continue
+			}
+			if custom.Type == "brutal" {
+				if err := applyTcpBrutal(fd, custom.Value); err != nil {
+					return err
+				}
 				continue
 			}
 			level := 0x6 // default TCP
@@ -152,6 +185,12 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 			}
 		}
 
+		if config.BrutalParams != "" {
+			if err := applyTcpBrutal(fd, config.BrutalParams); err != nil {
+				return err
+			}
+		}
+
 		if config.TcpWindowClamp > 0 {
 			if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_WINDOW_CLAMP, int(config.TcpWindowClamp)); err != nil {
 				return errors.New("failed to set TCP_WINDOW_CLAMP", err)
@@ -169,42 +208,47 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 				return errors.New("failed to set TCP_MAXSEG", err)
 			}
 		}
-	}
-
-	if len(config.CustomSockopt) > 0 {
-		for _, custom := range config.CustomSockopt {
-			if custom.System != "" && custom.System != runtime.GOOS {
-				errors.LogDebug(context.Background(), "CustomSockopt system not match: ", "want ", custom.System, " got ", runtime.GOOS)
-				continue
-			}
-			// Skip unwanted network type
-			// network might be tcp4 or tcp6
-			// use HasPrefix so that "tcp" can match tcp4/6 with "tcp" if user want to control all tcp (udp is also the same)
-			// if it is empty, strings.HasPrefix will always return true to make it apply for all networks
-			if !strings.HasPrefix(network, custom.Network) {
-				continue
-			}
-			level := 0x6 // default TCP
-			var opt int
-			if len(custom.Opt) == 0 {
-				return errors.New("No opt!")
-			} else {
-				opt, _ = strconv.Atoi(custom.Opt)
-			}
-			if custom.Level != "" {
-				level, _ = strconv.Atoi(custom.Level)
-			}
-			if custom.Type == "int" {
-				value, _ := strconv.Atoi(custom.Value)
-				if err := syscall.SetsockoptInt(int(fd), level, opt, value); err != nil {
-					return errors.New("failed to set CustomSockoptInt", opt, value, err)
+		if len(config.CustomSockopt) > 0 {
+			for _, custom := range config.CustomSockopt {
+				if custom.System != "" && custom.System != runtime.GOOS {
+					errors.LogDebug(context.Background(), "CustomSockopt system not match: ", "want ", custom.System, " got ", runtime.GOOS)
+					continue
 				}
-			} else if custom.Type == "str" {
-				if err := syscall.SetsockoptString(int(fd), level, opt, custom.Value); err != nil {
-					return errors.New("failed to set CustomSockoptString", opt, custom.Value, err)
+				// Skip unwanted network type
+				// network might be tcp4 or tcp6
+				// use HasPrefix so that "tcp" can match tcp4/6 with "tcp" if user want to control all tcp (udp is also the same)
+				// if it is empty, strings.HasPrefix will always return true to make it apply for all networks
+				if !strings.HasPrefix(network, custom.Network) {
+					continue
 				}
-			} else {
-				return errors.New("unknown CustomSockopt type:", custom.Type)
+				if custom.Type == "brutal" {
+					if err := applyTcpBrutal(fd, custom.Value); err != nil {
+						return err
+					}
+					continue
+				}
+				level := 0x6 // default TCP
+				var opt int
+				if len(custom.Opt) == 0 {
+					return errors.New("No opt!")
+				} else {
+					opt, _ = strconv.Atoi(custom.Opt)
+				}
+				if custom.Level != "" {
+					level, _ = strconv.Atoi(custom.Level)
+				}
+				if custom.Type == "int" {
+					value, _ := strconv.Atoi(custom.Value)
+					if err := syscall.SetsockoptInt(int(fd), level, opt, value); err != nil {
+						return errors.New("failed to set CustomSockoptInt", opt, value, err)
+					}
+				} else if custom.Type == "str" {
+					if err := syscall.SetsockoptString(int(fd), level, opt, custom.Value); err != nil {
+						return errors.New("failed to set CustomSockoptString", opt, custom.Value, err)
+					}
+				} else {
+					return errors.New("unknown CustomSockopt type:", custom.Type)
+				}
 			}
 		}
 	}

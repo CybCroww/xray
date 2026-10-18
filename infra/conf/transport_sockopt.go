@@ -63,10 +63,16 @@ type SocketConfig struct {
 	AddressPortStrategy   string                 `json:"addressPortStrategy"`
 	HappyEyeballsSettings *HappyEyeballsConfig   `json:"happyEyeballs"`
 	TrustedXForwardedFor  []string               `json:"trustedXForwardedFor"`
+	BrutalParams          string                 `json:"brutalParams"`
 }
 
 // Build implements Buildable.
 func (c *SocketConfig) Build() (*internet.SocketConfig, error) {
+	if c.BrutalParams != "" {
+		if _, _, err := internet.ParseBrutalParams(c.BrutalParams); err != nil {
+			return nil, err
+		}
+	}
 	tfo := int32(0) // don't invoke setsockopt() for TFO
 	if c.TFO != nil {
 		switch v := c.TFO.(type) {
@@ -123,6 +129,11 @@ func (c *SocketConfig) Build() (*internet.SocketConfig, error) {
 	var customSockopts []*internet.CustomSockopt
 
 	for _, copt := range c.CustomSockopt {
+		if copt.Type == "brutal" {
+			if _, _, err := internet.ParseBrutalParams(copt.Value); err != nil {
+				return nil, err
+			}
+		}
 		customSockopt := &internet.CustomSockopt{
 			System:  copt.System,
 			Network: copt.Network,
@@ -183,5 +194,6 @@ func (c *SocketConfig) Build() (*internet.SocketConfig, error) {
 		AddressPortStrategy:  addressPortStrategy,
 		HappyEyeballs:        happyEyeballs,
 		TrustedXForwardedFor: c.TrustedXForwardedFor,
+		BrutalParams:         c.BrutalParams,
 	}, nil
 }

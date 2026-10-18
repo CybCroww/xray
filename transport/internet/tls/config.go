@@ -384,12 +384,13 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 		VerifyPeerCertByName: slices.Clone(c.VerifyPeerCertByName),
 		PinnedPeerCertSha256: c.PinnedPeerCertSha256,
 	}
+	// VerifyPeerCertificate is skipped on resumed sessions, including cached sessions from other profiles.
 	config := &tls.Config{
 		Rand:                   randCarrier,
 		ClientSessionCache:     globalSessionCache,
 		RootCAs:                root,
 		NextProtos:             slices.Clone(c.NextProtocol),
-		SessionTicketsDisabled: !c.EnableSessionResumption,
+		SessionTicketsDisabled: !c.EnableSessionResumption || len(c.PinnedPeerCertSha256) > 0 || len(c.VerifyPeerCertByName) > 0,
 		VerifyPeerCertificate:  randCarrier.verifyPeerCert,
 	}
 	randCarrier.Config = config
