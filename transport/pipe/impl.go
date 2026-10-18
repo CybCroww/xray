@@ -32,6 +32,7 @@ func (o *pipeOption) isFull(curSize int32) bool {
 type pipe struct {
 	sync.Mutex
 	data        buf.MultiBuffer
+	dataSize    int32
 	readSignal  *signal.Notifier
 	writeSignal *signal.Notifier
 	done        *done.Instance
@@ -46,17 +47,15 @@ var (
 )
 
 func (p *pipe) Len() int32 {
-	data := p.data
-	if data == nil {
-		return 0
-	}
-	return data.Len()
+	p.Lock()
+	defer p.Unlock()
+	return p.dataSize
 }
 
 func (p *pipe) getState(forRead bool) error {
 	switch p.state {
 	case open:
-		if !forRead && p.option.isFull(p.data.Len()) {
+		if !forRead && p.option.isFull(p.dataSize) {
 			return errBufferFull
 		}
 		return nil
@@ -85,6 +84,7 @@ func (p *pipe) readMultiBufferInternal() (buf.MultiBuffer, error) {
 
 	data := p.data
 	p.data = nil
+	p.dataSize = 0
 	return data, nil
 }
 
@@ -133,6 +133,7 @@ func (p *pipe) writeMultiBufferInternal(mb buf.MultiBuffer) error {
 		return err
 	}
 
+	p.dataSize += mb.Len()
 	if p.data == nil {
 		p.data = mb
 	} else {
@@ -194,6 +195,7 @@ func (p *pipe) Interrupt() {
 	if !p.data.IsEmpty() {
 		buf.ReleaseMulti(p.data)
 		p.data = nil
+		p.dataSize = 0
 		if p.state == closed {
 			p.state = errord
 		}
