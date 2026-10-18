@@ -36,7 +36,7 @@ func (p TransportProtocol) Build() (string, error) {
 		return "", errors.PrintRemovedFeatureError("HTTP transport (without header padding, etc.)", "XHTTP stream-one H2 & H3")
 	case "quic":
 		return "", errors.PrintRemovedFeatureError("QUIC transport (without web service, etc.)", "XHTTP stream-one H3")
-	case "hysteria":
+	case "hysteria", "hysteria2", "hy2":
 		return "hysteria", nil
 	case "masque":
 		return "masque", nil
@@ -65,6 +65,8 @@ type StreamConfig struct {
 	WSSettings          *WebSocketConfig   `json:"wsSettings"`
 	HTTPUPGRADESettings *HttpUpgradeConfig `json:"httpupgradeSettings"`
 	HysteriaSettings    *HysteriaConfig    `json:"hysteriaSettings"`
+	Hysteria2Settings   *HysteriaConfig    `json:"hysteria2Settings"`
+	HY2Settings         *HysteriaConfig    `json:"hy2Settings"`
 	MASQUESettings      *MasqueConfig      `json:"masqueSettings"`
 	XDRIVESettings      *XDriveConfig      `json:"xdriveSettings"`
 	SocketSettings      *SocketConfig      `json:"sockopt"`
@@ -197,6 +199,12 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 			ProtocolName: "httpupgrade",
 			Settings:     serial.ToTypedMessage(hs),
 		})
+	}
+	if c.HysteriaSettings == nil {
+		c.HysteriaSettings = c.Hysteria2Settings
+	}
+	if c.HysteriaSettings == nil {
+		c.HysteriaSettings = c.HY2Settings
 	}
 	if c.HysteriaSettings != nil {
 		hs, err := c.HysteriaSettings.Build()
