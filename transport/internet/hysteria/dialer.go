@@ -58,6 +58,24 @@ func (c *client) status() status {
 	}
 }
 
+func retryIfInactive[T any](
+	ctx context.Context,
+	currentStatus func() status,
+	redial func(context.Context) error,
+	open func() (T, error),
+) (T, error) {
+	result, err := open()
+	if err == nil || currentStatus() != StatusInactive {
+		return result, err
+	}
+
+	var zero T
+	if err := redial(ctx); err != nil {
+		return zero, err
+	}
+	return open()
+}
+
 func (c *client) close() {
 	c.conn.CloseWithError(closeErrCodeOK, "")
 	c.tr.Close()
@@ -255,7 +273,9 @@ func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
 		return nil, err
 	}
 
-	stream, err := c.conn.OpenStream()
+	stream, err := retryIfInactive(ctx, c.status, c.dial, func() (*quic.Stream, error) {
+		return c.conn.OpenStream()
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +309,9 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 		return nil, errors.New("server does not support UDP relay")
 	}
 
-	return c.udpSM.udp()
+	return retryIfInactive(ctx, c.status, c.dial, func() (*InterConn, error) {
+		return c.udpSM.udp()
+	})
 }
 
 func parseUDPEnabled(value string) bool {
