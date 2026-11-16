@@ -408,7 +408,7 @@ type clientManager struct {
 }
 
 const (
-	nativeDialAttemptTimeout  = 4 * time.Second
+	nativeDialAttemptTimeout  = 11 * time.Second
 	nativeDialFailureCooldown = 30 * time.Second
 	nativeFallbackIdle        = 10 * time.Minute
 )
