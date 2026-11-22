@@ -763,14 +763,15 @@ type Masquerade struct {
 
 type HysteriaConfig struct {
 	Version        int32      `json:"version"`
+	Native         bool       `json:"native"`
 	Auth           string     `json:"auth"`
 	UdpIdleTimeout int64      `json:"udpIdleTimeout"`
 	Masquerade     Masquerade `json:"masquerade"`
 }
 
 func (c *HysteriaConfig) Build() (proto.Message, error) {
-	if c.Version != 2 {
-		return nil, errors.New("version != 2")
+	if err := checkHysteriaVersion(c.Version); err != nil {
+		return nil, err
 	}
 
 	if c.UdpIdleTimeout != 0 && (c.UdpIdleTimeout < 2 || c.UdpIdleTimeout > 600) {
@@ -778,6 +779,7 @@ func (c *HysteriaConfig) Build() (proto.Message, error) {
 	}
 
 	config := &hysteria.Config{}
+	config.Native = c.Native
 	config.Auth = c.Auth
 	config.UdpIdleTimeout = c.UdpIdleTimeout
 	config.MasqType = c.Masquerade.Type

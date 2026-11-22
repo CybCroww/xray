@@ -3,9 +3,11 @@ package hysteria
 import (
 	"context"
 	"math/rand"
+	"os"
 	"time"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/transport/internet"
 )
@@ -22,6 +24,7 @@ const (
 	StatusAuthOK              = 233
 	FrameTypeTCPRequest       = 0x401
 	MaxDatagramFrameSize      = 1200
+	MaxUDPSize                = 4096
 	udpMessageChanSize        = 1024
 	idleCleanupInterval       = 1 * time.Second
 )
@@ -52,6 +55,22 @@ var (
 )
 
 type datagramKey struct{}
+type targetKey struct{}
+
+func ContextWithNativeTarget(ctx context.Context, target net.Destination) context.Context {
+	return context.WithValue(ctx, targetKey{}, target)
+}
+
+func nativeRequested(settings *internet.MemoryStreamConfig) bool {
+	switch os.Getenv("XRAY_HYSTERIA_NATIVE") {
+	case "0":
+		return false
+	case "1":
+		return true
+	}
+	config, _ := settings.ProtocolSettings.(*Config)
+	return config.GetNative()
+}
 
 func ContextWithDatagram(ctx context.Context, v bool) context.Context {
 	return context.WithValue(ctx, datagramKey{}, v)

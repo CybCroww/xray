@@ -3,14 +3,12 @@ package hysteria
 import (
 	"context"
 	"crypto/rand"
-	gotls "crypto/tls"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
+	"os"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -22,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/handoff"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -46,8 +45,9 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 		h.Lock()
 		defer h.Unlock()
 
+		udpEnabled := h.addConn != nil
 		if h.auth {
-			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(h.validator != nil))
+			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(udpEnabled))
 			w.Header().Set(CommonHeaderCCRX, strconv.FormatUint(h.quicParams.BrutalDown, 10))
 			w.Header().Set(CommonHeaderPadding, AuthResponsePadding.String())
 			w.WriteHeader(StatusAuthOK)
@@ -91,7 +91,7 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 				panic(quicParams.Congestion)
 			}
 
-			if h.validator != nil {
+			if udpEnabled {
 				udpSM := &udpSessionManager{
 					conn: h.conn,
 					m:    make(map[uint32]*InterConn),
@@ -104,7 +104,7 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 				go udpSM.run()
 			}
 
-			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(h.validator != nil))
+			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(udpEnabled))
 			w.Header().Set(CommonHeaderCCRX, strconv.FormatUint(h.quicParams.BrutalDown, 10))
 			w.Header().Set(CommonHeaderPadding, AuthResponsePadding.String())
 			w.WriteHeader(StatusAuthOK)
@@ -122,7 +122,11 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *httpHandler) StreamDispatcher(ft http3.FrameType, stream *quic.Stream, err error) (bool, error) {
-	if err != nil || !h.auth {
+	h.Lock()
+	authenticated, user := h.auth, h.user
+	h.Unlock()
+
+	if err != nil || !authenticated {
 		return false, nil
 	}
 
@@ -137,7 +141,7 @@ func (h *httpHandler) StreamDispatcher(ft http3.FrameType, stream *quic.Stream, 
 			local:  h.conn.LocalAddr(),
 			remote: h.conn.RemoteAddr(),
 
-			user: h.user,
+			user: user,
 			lock: make(chan struct{}, 1),
 		})
 		return true, nil
@@ -156,6 +160,10 @@ type Listener struct {
 	pktConn  net.PacketConn
 	tr       *quic.Transport
 	listener *quic.Listener
+	tracked  bool
+	live     atomic.Uint64
+	closed   atomic.Bool
+	work     *generationWork
 }
 
 func (l *Listener) handleClient(conn *quic.Conn) {
@@ -177,6 +185,7 @@ func (l *Listener) handleClient(conn *quic.Conn) {
 }
 
 func (l *Listener) keepAccepting() {
+	defer l.closed.Store(true)
 	for {
 		conn, err := l.listener.Accept(context.Background())
 		if err != nil {
@@ -185,8 +194,71 @@ func (l *Listener) keepAccepting() {
 			}
 			break
 		}
-		go l.handleClient(conn)
+		if !l.tracked {
+			go l.handleClient(conn)
+			continue
+		}
+		l.live.Add(1)
+		go func() {
+			defer l.live.Add(^uint64(0))
+			l.handleClient(conn)
+		}()
 	}
+}
+
+func (l *Listener) GenerationConnections() (uint64, bool) {
+	return l.live.Load(), l.tracked && !l.closed.Load()
+}
+
+// ConnContext is called before the handshake is accepted and its context is
+// cancelled on handshake failure or connection close. Track this separately
+// from accepted HTTP/3 handlers, which may still be winding down afterwards.
+type generationWork struct {
+	count   atomic.Uint64
+	mu      sync.Mutex
+	retired bool
+}
+
+func (w *generationWork) track(ctx context.Context, _ *quic.ClientInfo) (context.Context, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.retired {
+		return nil, errors.New("managed QUIC generation retired")
+	}
+	w.count.Add(1)
+	context.AfterFunc(ctx, func() { w.count.Add(^uint64(0)) })
+	return ctx, nil
+}
+
+// TryDrainGeneration is irreversible only on success. The private queue marker
+// must be observed first; the QUIC server then evaluates idle after every
+// previously queued unknown-CID packet, including pre-Accept handshakes.
+func (l *Listener) TryDrainGeneration(token [16]byte) (bool, error) {
+	fence, ok := l.pktConn.(interface{ DrainFenceSeen([16]byte) bool })
+	if !l.tracked || l.work == nil || !ok || !fence.DrainFenceSeen(token) {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	return l.listener.TryRetireIdle(ctx, func() bool {
+		l.work.mu.Lock()
+		defer l.work.mu.Unlock()
+		if l.work.count.Load() != 0 || l.live.Load() != 0 {
+			return false
+		}
+		l.work.retired = true
+		return true
+	})
+}
+
+func (l *Listener) GenerationStatus() handoff.UDPConnectionStatus {
+	count, known := l.GenerationConnections()
+	status := handoff.UDPConnectionStatus{Count: count, Known: known}
+	if l.work != nil && known {
+		status.TransportWork = l.work.count.Load()
+		status.WorkKnown = !l.closed.Load()
+	}
+	return status
 }
 
 func (l *Listener) Addr() net.Addr {
@@ -194,10 +266,14 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) Close() error {
+	l.closed.Store(true)
 	return errors.Combine(l.listener.Close(), l.tr.Close(), l.pktConn.Close())
 }
 
 func Listen(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
+	if nativeRequested(streamSettings) {
+		return nativeListen(ctx, address, port, streamSettings, handler)
+	}
 	if address.Family().IsDomain() {
 		return nil, errors.New("address is domain")
 	}
@@ -214,72 +290,9 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		return nil, errors.New("validator is nil")
 	}
 
-	var masqHandler http.Handler
-	switch strings.ToLower(config.MasqType) {
-	case "", "404":
-		masqHandler = http.NotFoundHandler()
-	case "file":
-		masqHandler = http.FileServer(http.Dir(config.MasqFile))
-	case "proxy":
-		u, err := url.Parse(config.MasqUrl)
-		if err != nil {
-			return nil, err
-		}
-		transport := http.DefaultTransport.(*http.Transport)
-		switch u.Scheme {
-		case "http", "https":
-			if config.MasqUrlInsecure {
-				transport = transport.Clone()
-				if transport.TLSClientConfig == nil {
-					transport.TLSClientConfig = &gotls.Config{}
-				}
-				transport.TLSClientConfig.InsecureSkipVerify = true
-			}
-		case "", "unix":
-			path := u.Path
-			u = &url.URL{Scheme: "http", Host: "localhost"}
-			dialer := &net.Dialer{Timeout: 30 * time.Second}
-			transport = transport.Clone()
-			transport.Proxy = nil
-			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialer.DialContext(ctx, "unix", path)
-			}
-			transport.MaxIdleConns = masqueradeProxyMaxIdleConnections
-			transport.MaxIdleConnsPerHost = masqueradeProxyMaxIdleConnsPerHost
-		default:
-			return nil, errors.New("unknown scheme")
-		}
-		masqHandler = &httputil.ReverseProxy{
-			Rewrite: func(r *httputil.ProxyRequest) {
-				r.SetURL(u)
-				if !config.MasqUrlRewriteHost {
-					r.Out.Host = r.In.Host
-				}
-				if config.MasqUrlXForwarded {
-					r.SetXForwarded()
-				}
-			},
-			Transport:  transport,
-			BufferPool: newMasqueradeProxyBufferPool(),
-			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-				errors.LogErrorInner(context.Background(), err, "HTTP reverse proxy error")
-				w.WriteHeader(http.StatusBadGateway)
-			},
-		}
-	case "string":
-		masqHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			for k, v := range config.MasqStringHeaders {
-				w.Header().Set(k, v)
-			}
-			if config.MasqStringStatusCode != 0 {
-				w.WriteHeader(int(config.MasqStringStatusCode))
-			} else {
-				w.WriteHeader(http.StatusOK)
-			}
-			_, _ = w.Write([]byte(config.MasqString))
-		})
-	default:
-		return nil, errors.New("unknown masq type")
+	masqHandler, err := newMasqueradeHandler(config)
+	if err != nil {
+		return nil, err
 	}
 
 	quicParams := streamSettings.QuicParams
@@ -323,8 +336,23 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	}
 
 	var pktConn net.PacketConn
-	var err error
-	if streamSettings.FinalMask != nil {
+	ingress := generationFromContext(ctx)
+	if ingress != nil {
+		if export, ok := ingress.packet.(interface{ RingFiles() [3]*os.File }); ok && export.RingFiles()[0] != nil {
+			return nil, errors.New("managed packet ring is supported by native Hysteria only")
+		}
+		if export, ok := ingress.packet.(interface{ TransmitFile() (*os.File, error) }); ok {
+			file, err := export.TransmitFile()
+			if err != nil {
+				return nil, err
+			}
+			if file != nil {
+				file.Close()
+				return nil, errors.New("direct managed UDP transmit is supported by native Hysteria only")
+			}
+		}
+		pktConn = ingress.packet
+	} else if streamSettings.FinalMask != nil {
 		pktConn, err = streamSettings.FinalMask.ListenPacket(context.Background(), &net.UDPAddr{IP: address.IP(), Port: int(port)})
 	} else {
 		pktConn, err = internet.ListenSystemPacket(context.Background(), &net.UDPAddr{IP: address.IP(), Port: int(port)}, streamSettings.SocketSettings)
@@ -340,6 +368,12 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	}
 
 	tr := &quic.Transport{Conn: pktConn, DisableGSO: quicParams.DisableGSO, StatelessResetKey: k}
+	var work *generationWork
+	if ingress != nil {
+		work = new(generationWork)
+		tr.ConnContext = work.track
+		tr.ConnectionIDGenerator = generationCIDGenerator{codec: handoff.NewQUICCIDCodec(ingress.key), slot: ingress.slot}
+	}
 
 	listener, err := tr.Listen(tlsConfig.GetTLSConfig(tls.WithNextProto("h3")), quicConfig)
 	if err != nil {
@@ -358,6 +392,8 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		pktConn:  pktConn,
 		tr:       tr,
 		listener: listener,
+		tracked:  ingress != nil,
+		work:     work,
 	}
 
 	go l.keepAccepting()

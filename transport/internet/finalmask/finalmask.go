@@ -43,6 +43,40 @@ type FinalMask struct {
 	listenPacket func(context.Context, net.Addr) (net.PacketConn, error)
 }
 
+// UDPMasks returns the configured masks for native transport capability checks.
+func (fm *FinalMask) UDPMasks() []UDPMask {
+	return slices.Clone(fm.udpMasks)
+}
+
+func (fm *FinalMask) HasTCPMasks() bool { return len(fm.tcpMasks) != 0 }
+
+// WithPacketListener preserves mask order while supplying a previously bound
+// public socket. Listener-owning masks must be validated by the caller.
+func (fm *FinalMask) WithPacketListener(listen func(context.Context, net.Addr) (net.PacketConn, error)) *FinalMask {
+	configured := *fm
+	configured.listenPacket = listen
+	return &configured
+}
+
+func (fm *FinalMask) WithPacketConnSetup(setup func(net.PacketConn)) *FinalMask {
+	configured := *fm
+	configured.dialUDP = func(ctx context.Context, dest net.Destination) (net.PacketConn, net.Addr, error) {
+		packet, address, err := fm.dialUDP(ctx, dest)
+		if err == nil {
+			setup(packet)
+		}
+		return packet, address, err
+	}
+	configured.listenPacket = func(ctx context.Context, address net.Addr) (net.PacketConn, error) {
+		packet, err := fm.listenPacket(ctx, address)
+		if err == nil {
+			setup(packet)
+		}
+		return packet, err
+	}
+	return &configured
+}
+
 func NewFinalMask(tcpMasks []TCPMask, udpMasks []UDPMask, dialTCP func(context.Context, net.Destination) (net.Conn, error), listen func(context.Context, net.Addr) (net.Listener, error), dialUDP func(context.Context, net.Destination) (net.PacketConn, net.Addr, error), listenPacket func(context.Context, net.Addr) (net.PacketConn, error)) *FinalMask {
 	slices.Reverse(tcpMasks)
 	slices.Reverse(udpMasks)

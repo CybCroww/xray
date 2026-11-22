@@ -1,0 +1,161 @@
+// Package handoff implements transport primitives for overlapping Xray generations.
+package handoff
+
+import (
+	"errors"
+	"net"
+	"os"
+	"sync"
+	"time"
+)
+
+type gatedSocket interface {
+	net.Listener
+	File() (*os.File, error)
+	SetDeadline(time.Time) error
+}
+
+// TCPListener gates Accept without modifying the underlying listen queue.
+// Each generation owns its own Go listener (and poller) for the same socket.
+// Accepted connections are returned unchanged; the gate is not a TCP proxy.
+type TCPListener struct {
+	socket gatedSocket
+	change sync.Mutex
+	mu     sync.Mutex
+	state  *sync.Cond
+	active bool
+	closed bool
+	accept int
+}
+
+func NewTCPListener(socket *net.TCPListener, active bool) *TCPListener {
+	return newGatedListener(socket, active)
+}
+
+func newGatedListener(socket gatedSocket, active bool) *TCPListener {
+	l := &TCPListener{socket: socket, active: active}
+	l.state = sync.NewCond(&l.mu)
+	return l
+}
+
+// ImportUnixListener leaves the socket path owned by the supervisor, not by
+// either generation. No additional local forwarding hop is introduced.
+func ImportUnixListener(file *os.File) (*TCPListener, error) {
+	l, err := net.FileListener(file)
+	if err != nil {
+		return nil, err
+	}
+	socket, ok := l.(*net.UnixListener)
+	if !ok || l.Addr().Network() != "unix" {
+		l.Close()
+		return nil, errors.New("handoff descriptor is not a Unix stream listener")
+	}
+	socket.SetUnlinkOnClose(false)
+	if err := validateListeningSocket(socket); err != nil {
+		socket.Close()
+		return nil, err
+	}
+	return newGatedListener(socket, false), nil
+}
+
+// ImportTCPListener duplicates the passed listener descriptor. It does not
+// consume the passed descriptor and the new gate starts paused.
+func ImportTCPListener(file *os.File) (*TCPListener, error) {
+	l, err := net.FileListener(file)
+	if err != nil {
+		return nil, err
+	}
+	tcp, ok := l.(*net.TCPListener)
+	if !ok {
+		l.Close()
+		return nil, errors.New("handoff descriptor is not a TCP listener")
+	}
+	if err := validateListeningSocket(tcp); err != nil {
+		tcp.Close()
+		return nil, err
+	}
+	return NewTCPListener(tcp, false), nil
+}
+
+// File returns a duplicate of the listening socket for the next generation.
+// It never transfers connected sockets or interrupts an existing accept.
+func (l *TCPListener) File() (*os.File, error) { return l.socket.File() }
+
+func (l *TCPListener) Addr() net.Addr { return l.socket.Addr() }
+
+func (l *TCPListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for {
+		for !l.active && !l.closed {
+			l.state.Wait()
+		}
+		if l.closed {
+			return nil, net.ErrClosed
+		}
+		l.accept++
+		l.mu.Unlock()
+		conn, err := l.socket.Accept()
+		l.mu.Lock()
+		l.accept--
+		l.state.Broadcast()
+		// A successful accept won the race before Pause drained the accept
+		// call. It belongs to this generation; dropping it would reset the
+		// connection. A deadline used to wake a paused Accept is internal.
+		if err == nil || l.closed || l.active || !errors.Is(err, os.ErrDeadlineExceeded) {
+			return conn, err
+		}
+	}
+}
+
+// Pause waits for this generation's in-flight Accept calls to leave the
+// socket. New connections can queue in the kernel until another gate resumes.
+// It does not close accepted connections or the underlying listen socket.
+func (l *TCPListener) Pause() error {
+	l.change.Lock()
+	defer l.change.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return net.ErrClosed
+	}
+	if l.active {
+		if err := l.socket.SetDeadline(time.Now()); err != nil {
+			return err
+		}
+		l.active = false
+		for l.accept != 0 {
+			l.state.Wait()
+		}
+	}
+	return nil
+}
+
+func (l *TCPListener) Resume() error {
+	l.change.Lock()
+	defer l.change.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return net.ErrClosed
+	}
+	if !l.active {
+		if err := l.socket.SetDeadline(time.Time{}); err != nil {
+			return err
+		}
+		l.active = true
+		l.state.Broadcast()
+	}
+	return nil
+}
+
+// Close releases only this generation's copy of the listening socket.
+func (l *TCPListener) Close() error {
+	l.change.Lock()
+	defer l.change.Unlock()
+	l.mu.Lock()
+	l.closed = true
+	l.state.Broadcast()
+	l.mu.Unlock()
+	return l.socket.Close()
+}

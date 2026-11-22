@@ -3,8 +3,10 @@ package hysteria
 import (
 	"context"
 	gotls "crypto/tls"
+	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -56,6 +58,24 @@ func (c *client) status() status {
 	default:
 		return StatusActive
 	}
+}
+
+func retryIfInactive[T any](
+	ctx context.Context,
+	currentStatus func() status,
+	redial func(context.Context) error,
+	open func() (T, error),
+) (T, error) {
+	result, err := open()
+	if err == nil || currentStatus() != StatusInactive {
+		return result, err
+	}
+
+	var zero T
+	if err := redial(ctx); err != nil {
+		return zero, err
+	}
+	return open()
 }
 
 func (c *client) close() {
@@ -199,25 +219,30 @@ func (c *client) dial(ctx context.Context) error {
 		return errors.New("auth failed code ", resp.StatusCode)
 	}
 
-	// udp, _ := strconv.ParseBool(resp.Header.Get(ResponseHeaderUDPEnabled))
+	udpEnabled := parseUDPEnabled(resp.Header.Get(ResponseHeaderUDPEnabled))
 	remote_rx, _ := strconv.ParseUint(resp.Header.Get(CommonHeaderCCRX), 10, 64)
 	tx := quicParams.BrutalUp
 	errors.LogDebug(context.Background(), "ECHAccepted ", conn.ConnectionState().TLS.ECHAccepted)
 
+	selectedCongestion := "bbr"
 	switch quicParams.Congestion {
 	case "reno":
+		selectedCongestion = "reno"
 	case "bbr":
+		selectedCongestion = "bbr"
 		congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
 	case "", "brutal":
 		if tx == 0 {
 			congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
 		} else {
+			selectedCongestion = "brutal"
 			if remote_rx > 0 {
 				tx = min(tx, remote_rx)
 			}
 			congestion.UseBrutal(conn, tx, quicParams.BrutalDisableLossCompensation)
 		}
 	case "force-brutal":
+		selectedCongestion = "force-brutal"
 		congestion.UseBrutal(conn, quicParams.BrutalUp, quicParams.BrutalDisableLossCompensation)
 	default:
 		panic(quicParams.Congestion)
@@ -228,14 +253,76 @@ func (c *client) dial(ctx context.Context) error {
 	c.conn = conn
 	c.aliveTCP = &atomic.Int64{}
 	c.lastAlive = time.Now()
-	c.udpSM = &udpSessionManager{
-		conn: conn,
-		m:    make(map[uint32]*InterConn),
-		next: 1,
+	if udpEnabled {
+		c.udpSM = &udpSessionManager{
+			conn: conn,
+			m:    make(map[uint32]*InterConn),
+			next: 1,
+		}
+		go c.udpSM.run()
+	} else {
+		c.udpSM = nil
 	}
-	go c.udpSM.run()
+	if os.Getenv("XRAY_NET_DIAG") == "1" {
+		fmt.Printf("[XRAY_NET_DIAG][HYSTERIA] connected peer=%s cc=%s\n", c.dest, selectedCongestion)
+		go reportConnectionStats(conn, c.dest, c.aliveTCP, c.udpSM)
+	}
 
 	return nil
+}
+
+func reportConnectionStats(conn *quic.Conn, dest net.Destination, aliveTCP *atomic.Int64, udpSM *udpSessionManager) {
+	var previousSent, previousLost uint64
+	sampled := time.Now()
+	logStats := func() {
+		stats := conn.ConnectionStats()
+		sent := stats.PacketsSent - previousSent
+		lost := stats.PacketsLost - previousLost
+		windowPercent := "n/a"
+		if sent > 0 {
+			windowPercent = fmt.Sprintf("%.3f", 100*float64(lost)/float64(sent))
+		}
+		udpSessions := 0
+		if udpSM != nil {
+			udpSM.RLock()
+			udpSessions = len(udpSM.m)
+			udpSM.RUnlock()
+		}
+		fmt.Printf(
+			"[XRAY_NET_DIAG][HYSTERIA] peer=%s rtt_ms=%d/%d/%d tx_bytes=%d tx_packets=%d rx_bytes=%d rx_packets=%d lost_packets=%d tcp=%d udp=%d loss_total_pct=%.3f sample_ms=%d sent_delta=%d lost_delta=%d loss_window_pct=%s\n",
+			dest,
+			stats.LatestRTT.Milliseconds(),
+			stats.SmoothedRTT.Milliseconds(),
+			stats.MinRTT.Milliseconds(),
+			stats.BytesSent,
+			stats.PacketsSent,
+			stats.BytesReceived,
+			stats.PacketsReceived,
+			stats.PacketsLost,
+			aliveTCP.Load(),
+			udpSessions,
+			100*float64(stats.PacketsLost)/float64(max(1, stats.PacketsSent)),
+			time.Since(sampled).Milliseconds(),
+			sent,
+			lost,
+			windowPercent,
+		)
+		previousSent, previousLost = stats.PacketsSent, stats.PacketsLost
+		sampled = time.Now()
+	}
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	logStats()
+	for {
+		select {
+		case <-conn.Context().Done():
+			logStats()
+			return
+		case <-ticker.C:
+			logStats()
+		}
+	}
 }
 
 func (c *client) unlock() {
@@ -255,7 +342,9 @@ func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
 		return nil, err
 	}
 
-	stream, err := c.conn.OpenStream()
+	stream, err := retryIfInactive(ctx, c.status, c.dial, func() (*quic.Stream, error) {
+		return c.conn.OpenStream()
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -285,8 +374,18 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 	if err != nil {
 		return nil, err
 	}
+	if c.udpSM == nil {
+		return nil, errors.New("server does not support UDP relay")
+	}
 
-	return c.udpSM.udp()
+	return retryIfInactive(ctx, c.status, c.dial, func() (*InterConn, error) {
+		return c.udpSM.udp()
+	})
+}
+
+func parseUDPEnabled(value string) bool {
+	enabled, err := strconv.ParseBool(value)
+	return err == nil && enabled
 }
 
 func (c *client) clean(force bool) {
@@ -331,6 +430,154 @@ type clientManager struct {
 	m map[dialerConf]*client
 }
 
+const (
+	nativeDialAttemptTimeout  = 11 * time.Second
+	nativeDialFailureCooldown = 30 * time.Second
+	nativeFallbackIdle        = 10 * time.Minute
+)
+
+type nativeFallbackKey struct {
+	instance *core.Instance
+	settings *internet.MemoryStreamConfig
+	peer     string
+}
+
+type nativeFallbackEntry struct {
+	until    time.Time
+	lastUsed time.Time
+	probing  bool
+	healthy  bool
+	changed  chan struct{}
+}
+
+type nativeDialFallback struct {
+	mu             sync.Mutex
+	entries        map[nativeFallbackKey]nativeFallbackEntry
+	cooldown       time.Duration
+	attemptTimeout time.Duration
+}
+
+var nativeFallback = nativeDialFallback{
+	entries: make(map[nativeFallbackKey]nativeFallbackEntry),
+}
+
+func (b *nativeDialFallback) open(
+	ctx context.Context,
+	key nativeFallbackKey,
+	tryNative func(context.Context) (stat.Connection, error),
+	tryGo func(context.Context) (stat.Connection, error),
+) (stat.Connection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		now := time.Now()
+		b.mu.Lock()
+		if b.entries == nil {
+			b.entries = make(map[nativeFallbackKey]nativeFallbackEntry)
+		}
+		if len(b.entries) > 512 {
+			for candidate, entry := range b.entries {
+				expired := !entry.until.IsZero() && !now.Before(entry.until)
+				idle := !entry.lastUsed.IsZero() && now.Sub(entry.lastUsed) >= nativeFallbackIdle
+				if !entry.probing && (expired || idle) {
+					delete(b.entries, candidate)
+				}
+			}
+		}
+		entry := b.entries[key]
+		entry.lastUsed = now
+		if entry.probing {
+			b.entries[key] = entry
+			changed := entry.changed
+			b.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-changed:
+				continue
+			}
+		}
+		if now.Before(entry.until) {
+			b.entries[key] = entry
+			b.mu.Unlock()
+			return tryGo(ctx)
+		}
+		var probe chan struct{}
+		if !entry.healthy {
+			entry.probing = true
+			entry.changed = make(chan struct{})
+			probe = entry.changed
+		}
+		b.entries[key] = entry
+		b.mu.Unlock()
+
+		timeout := b.attemptTimeout
+		if timeout <= 0 {
+			timeout = nativeDialAttemptTimeout
+		}
+		nativeCtx, cancel := context.WithTimeout(ctx, timeout)
+		conn, nativeErr := tryNative(nativeCtx)
+		cancel()
+		if nativeErr == nil {
+			if probe != nil {
+				b.finishProbe(key, probe, true, time.Time{})
+			}
+			return conn, nil
+		}
+		if ctx.Err() != nil {
+			if probe != nil {
+				b.finishProbe(key, probe, false, time.Time{})
+			}
+			return nil, nativeErr
+		}
+
+		cooldown := b.cooldown
+		if cooldown <= 0 {
+			cooldown = nativeDialFailureCooldown
+		}
+		if probe != nil {
+			b.finishProbe(key, probe, false, time.Now().Add(cooldown))
+		} else {
+			b.mu.Lock()
+			b.entries[key] = nativeFallbackEntry{until: time.Now().Add(cooldown), lastUsed: time.Now()}
+			b.mu.Unlock()
+		}
+
+		if os.Getenv("XRAY_NET_DIAG") == "1" {
+			fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] native dial failed; using Go backend peer=%s cooldown=%s reason=%v\n", key.peer, cooldown, nativeErr)
+		}
+		conn, goErr := tryGo(ctx)
+		if goErr != nil {
+			return nil, fmt.Errorf("native dial failed (%v); Go fallback failed: %w", nativeErr, goErr)
+		}
+		return conn, nil
+	}
+}
+
+func (b *nativeDialFallback) finishProbe(key nativeFallbackKey, probe chan struct{}, healthy bool, until time.Time) {
+	b.mu.Lock()
+	entry, ok := b.entries[key]
+	if ok && entry.probing && entry.changed == probe {
+		entry.probing = false
+		entry.healthy = healthy
+		entry.until = until
+		entry.lastUsed = time.Now()
+		entry.changed = nil
+		if !healthy && until.IsZero() {
+			delete(b.entries, key)
+		} else {
+			b.entries[key] = entry
+		}
+		close(probe)
+	}
+	b.mu.Unlock()
+}
+
 func (m *clientManager) clean() {
 	ticker := time.NewTicker(idleCleanupInterval)
 	for range ticker.C {
@@ -358,6 +605,29 @@ var (
 )
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
+	if nativeRequested(streamSettings) {
+		peer := dest
+		peer.Network = net.Network_UDP
+		key := nativeFallbackKey{
+			instance: core.FromContext(ctx),
+			settings: streamSettings,
+			peer:     peer.String(),
+		}
+		return nativeFallback.open(
+			ctx,
+			key,
+			func(nativeCtx context.Context) (stat.Connection, error) {
+				return nativeDial(nativeCtx, dest, streamSettings)
+			},
+			func(goCtx context.Context) (stat.Connection, error) {
+				return dialGo(goCtx, dest, streamSettings)
+			},
+		)
+	}
+	return dialGo(ctx, dest, streamSettings)
+}
+
+func dialGo(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	if tlsConfig == nil {
 		return nil, errors.New("tls config is nil")

@@ -99,6 +99,14 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		}
 	}
 
+	if native, reader, writer, ok := nativeLink(conn); ok {
+		target := native.NativeHysteriaTarget()
+		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+			From: conn.RemoteAddr(), To: target, Status: log.AccessAccepted, Email: inbound.User.Email,
+		})
+		return dispatcher.DispatchLink(ctx, target, &transport.Link{Reader: reader, Writer: writer})
+	}
+
 	if _, ok := iConn.(*hysteria.InterConn); ok {
 		reader := &UDPReader{
 			reader: conn,

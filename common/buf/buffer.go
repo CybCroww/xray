@@ -2,6 +2,7 @@ package buf
 
 import (
 	"io"
+	"sync"
 
 	"github.com/xtls/xray-core/common/bytespool"
 	"github.com/xtls/xray-core/common/errors"
@@ -15,16 +16,14 @@ const (
 
 var ErrBufferFull = errors.New("buffer is full")
 
-var pool = bytespool.GetPool(Size)
+var pool = &sync.Pool{New: func() any { return new([Size]byte) }}
 
 // ownership represents the data owner of the buffer.
-type ownership uint8
+type ownership struct {
+	release func()
+}
 
-const (
-	managed ownership = iota
-	unmanaged
-	bytespools
-)
+var unmanaged, bytespools ownership
 
 // Buffer is a recyclable allocation of a byte array. Buffer.Release() recycles
 // the buffer into an internal buffer pool, in order to recreate a buffer more
@@ -33,21 +32,19 @@ type Buffer struct {
 	v         []byte
 	start     int32
 	end       int32
-	ownership ownership
+	ownership *ownership
 	UDP       *net.Destination
 }
 
-// New creates a Buffer with 0 length and 8K capacity, managed.
-func New() *Buffer {
-	buf := pool.Get().([]byte)
-	if cap(buf) >= Size {
-		buf = buf[:Size]
-	} else {
-		buf = make([]byte, Size)
-	}
+type ownedBuffer struct {
+	Buffer
+	owner ownership
+}
 
+// New creates a managed Buffer with zero length and Size capacity.
+func New() *Buffer {
 	return &Buffer{
-		v: buf,
+		v: pool.Get().(*[Size]byte)[:],
 	}
 }
 
@@ -73,22 +70,24 @@ func FromBytes(b []byte) *Buffer {
 	return &Buffer{
 		v:         b,
 		end:       int32(len(b)),
-		ownership: unmanaged,
+		ownership: &unmanaged,
 	}
+}
+
+func FromBytesWithRelease(data []byte, release func()) *Buffer {
+	if release == nil {
+		panic("nil buffer release callback")
+	}
+	buffer := &ownedBuffer{Buffer: Buffer{v: data, end: int32(len(data))}, owner: ownership{release: release}}
+	buffer.ownership = &buffer.owner
+	return &buffer.Buffer
 }
 
 // StackNew creates a new Buffer object on stack, managed.
 // This method is for buffers that is released in the same function.
 func StackNew() Buffer {
-	buf := pool.Get().([]byte)
-	if cap(buf) >= Size {
-		buf = buf[:Size]
-	} else {
-		buf = make([]byte, Size)
-	}
-
 	return Buffer{
-		v: buf,
+		v: pool.Get().(*[Size]byte)[:],
 	}
 }
 
@@ -96,27 +95,31 @@ func StackNew() Buffer {
 func NewWithSize(size int32) *Buffer {
 	return &Buffer{
 		v:         bytespool.Alloc(size),
-		ownership: bytespools,
+		ownership: &bytespools,
 	}
 }
 
 // Release recycles the buffer into an internal buffer pool.
 func (b *Buffer) Release() {
-	if b == nil || b.v == nil || b.ownership == unmanaged {
+	if b == nil || b.ownership == &unmanaged || b.v == nil && b.ownership == nil {
 		return
 	}
 
 	p := b.v
 	b.v = nil
 	b.Clear()
-
-	switch b.ownership {
-	case managed:
+	owner := b.ownership
+	b.ownership = nil
+	switch owner {
+	case nil:
 		if cap(p) == Size {
-			pool.Put(p)
+			pool.Put((*[Size]byte)(p))
 		}
-	case bytespools:
+	case &bytespools:
 		bytespool.Free(p)
+	default:
+		b.UDP = nil
+		owner.release()
 	}
 	b.UDP = nil
 }

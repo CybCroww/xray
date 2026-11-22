@@ -26,6 +26,76 @@ func TestBufferClear(t *testing.T) {
 	}
 }
 
+func TestOwnedBufferReleaseAndPartialRead(t *testing.T) {
+	data := []byte("owned payload")
+	released := 0
+	buffer := FromBytesWithRelease(data, func() { released++ })
+	if &buffer.Bytes()[0] != &data[0] {
+		t.Fatal("owned buffer copied the payload")
+	}
+	buffer.Advance(6)
+	if string(buffer.Bytes()) != "payload" {
+		t.Fatal("owned buffer lost its unread suffix")
+	}
+	buffer.Release()
+	buffer.Release()
+	if released != 1 || !buffer.IsEmpty() {
+		t.Fatalf("release count=%d length=%d", released, buffer.Len())
+	}
+	borrowed := FromBytes(data)
+	borrowed.Release()
+	if string(borrowed.Bytes()) != string(data) {
+		t.Fatal("borrowed buffer behavior changed")
+	}
+	empty := FromBytesWithRelease(nil, func() { released++ })
+	empty.Release()
+	empty.Release()
+	if released != 2 {
+		t.Fatal("empty owned buffer did not release exactly once")
+	}
+}
+
+func TestRegularBufferCapacityMatchesReleasePool(t *testing.T) {
+	for range 32 {
+		buffer := New()
+		if cap(buffer.Bytes()) != Size {
+			t.Fatalf("managed capacity %d cannot return to the %d-byte pool", cap(buffer.Bytes()), Size)
+		}
+		buffer.Write([]byte("reused"))
+		buffer.Release()
+		buffer.Release()
+		stack := StackNew()
+		if cap(stack.Bytes()) != Size {
+			t.Fatalf("stack buffer has incompatible pool capacity: %d", cap(stack.Bytes()))
+		}
+		if !stack.IsEmpty() {
+			t.Fatal("reused buffer retained its previous length")
+		}
+		stack.Release()
+	}
+}
+
+func BenchmarkRegularBufferReuse(b *testing.B) {
+	b.ReportAllocs()
+	b.SetBytes(Size)
+	for b.Loop() {
+		buffer := New()
+		buffer.Extend(32)
+		buffer.Release()
+	}
+}
+
+func TestRegularBufferReuseDoesNotAllocate(t *testing.T) {
+	allocations := testing.AllocsPerRun(1000, func() {
+		buffer := New()
+		buffer.Extend(32)
+		buffer.Release()
+	})
+	if allocations != 0 {
+		t.Fatalf("regular buffer reuse allocated %.1f objects", allocations)
+	}
+}
+
 func TestBufferIsEmpty(t *testing.T) {
 	buffer := New()
 	defer buffer.Release()

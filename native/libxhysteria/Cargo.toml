@@ -1,0 +1,60 @@
+[package]
+name = "xhysteria"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "MPL-2.0"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+aes = { version = "=0.8.4", optional = true }
+blake2b_simd = "=1.0.5"
+libc = "=0.2.191"
+getrandom = "=0.4.3"
+bytes = { version = "=1.12.1", optional = true }
+h3 = { version = "=0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"], optional = true }
+h3-quinn = { version = "=0.0.10", optional = true }
+http = { version = "=1.5.0", optional = true }
+httpdate = { version = "=1.0.3", optional = true }
+quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+quinn-proto = { version = "=0.11.19", default-features = false, optional = true }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"], optional = true }
+rustls-pemfile = { version = "=2.2.0", optional = true }
+tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "macros", "net", "time", "io-util", "sync"], optional = true }
+subtle = "=2.6.1"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+webpki-roots = { version = "1", optional = true }
+
+[dev-dependencies]
+blake2 = "=0.10.6"
+
+[patch.crates-io]
+quinn = { path = "vendor/quinn" }
+quinn-proto = { path = "vendor/quinn-proto" }
+h3-quinn = { path = "vendor/h3-quinn" }
+
+[features]
+probe = ["dep:bytes", "dep:h3", "dep:h3-quinn", "dep:http", "dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:tokio"]
+engine = ["probe", "dep:aes", "dep:serde", "dep:serde_json", "dep:webpki-roots", "dep:quinn-proto", "dep:httpdate"]
+allocation-profile = ["engine"]
+
+[[bin]]
+name = "xhys-probe"
+path = "src/bin/probe.rs"
+required-features = ["probe"]
+
+[[bin]]
+name = "xhys-echo"
+path = "src/bin/echo.rs"
+required-features = ["probe"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

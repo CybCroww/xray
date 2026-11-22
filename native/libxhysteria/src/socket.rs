@@ -1,0 +1,401 @@
+//! Salamander over Quinn's batched UDP I/O and nonfatal send-error handling.
+
+use crate::salamander::{SALT_LEN, Salamander};
+use quinn::{AsyncUdpSocket, Runtime, UdpPoller, udp};
+use std::{
+    fmt,
+    io::{self, IoSliceMut},
+    net::SocketAddr,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+};
+
+#[derive(Debug)]
+pub struct ReceiveSocket {
+    socket: Arc<dyn AsyncUdpSocket>,
+    segments: usize,
+}
+
+impl ReceiveSocket {
+    pub fn new(
+        socket: Arc<dyn AsyncUdpSocket>,
+        descriptor: std::os::fd::RawFd,
+        compact: bool,
+    ) -> Self {
+        let mut segments = socket.max_receive_segments();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if compact && segments > 1 {
+            let disabled = 0i32;
+            let result = unsafe {
+                libc::setsockopt(
+                    descriptor,
+                    libc::SOL_UDP,
+                    libc::UDP_GRO,
+                    (&disabled as *const i32).cast(),
+                    std::mem::size_of_val(&disabled) as libc::socklen_t,
+                )
+            };
+            if result == 0 {
+                segments = 1;
+            }
+        }
+        Self { socket, segments }
+    }
+}
+
+impl AsyncUdpSocket for ReceiveSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        self.socket.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
+        self.socket.try_send(transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        self.socket.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.socket.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.segments
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.socket.may_fragment()
+    }
+}
+
+pub struct MaskedSocket {
+    socket: Arc<dyn AsyncUdpSocket>,
+    mask: Salamander,
+    send_buffer: Mutex<SendBuffer>,
+}
+
+struct SendBuffer {
+    wire: Vec<u8>,
+    salts: [u8; 4096],
+    remaining: usize,
+}
+
+impl MaskedSocket {
+    pub fn new(socket: std::net::UdpSocket, psk: &[u8]) -> io::Result<Self> {
+        Ok(Self {
+            socket: quinn::TokioRuntime.wrap_udp_socket(socket)?,
+            mask: Salamander::new(psk).map_err(io::Error::other)?,
+            send_buffer: Mutex::new(SendBuffer {
+                wire: Vec::with_capacity(65536),
+                salts: [0; 4096],
+                remaining: 0,
+            }),
+        })
+    }
+}
+
+impl fmt::Debug for MaskedSocket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MaskedSocket")
+            .field("socket", &self.socket)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AsyncUdpSocket for MaskedSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        self.socket.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
+        let stride = transmit.segment_size.unwrap_or(transmit.contents.len());
+        if stride == 0
+            || stride > u16::MAX as usize - SALT_LEN
+            || transmit.contents.len().div_ceil(stride) > 32
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Salamander segmentation",
+            ));
+        }
+        let mut buffer = self
+            .send_buffer
+            .lock()
+            .map_err(|_| io::Error::other("send lock poisoned"))?;
+        let SendBuffer {
+            wire,
+            salts,
+            remaining,
+        } = &mut *buffer;
+        let salt_bytes = transmit.contents.len().div_ceil(stride) * SALT_LEN;
+        if *remaining < salt_bytes {
+            getrandom::fill(salts).map_err(io::Error::other)?;
+            *remaining = salts.len();
+        }
+        let start = salts.len() - *remaining;
+        *remaining -= salt_bytes;
+        self.mask.seal_segments(
+            transmit.contents,
+            stride,
+            &salts[start..start + salt_bytes],
+            wire,
+        );
+        let masked = udp::Transmit {
+            contents: wire,
+            segment_size: transmit.segment_size.map(|n| n + SALT_LEN),
+            ..*transmit
+        };
+        self.socket.try_send(&masked)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        for _ in 0..32 {
+            let count = match self.socket.poll_recv(cx, bufs, meta) {
+                Poll::Ready(Ok(count)) => count,
+                result => return result,
+            };
+            if count == 0 {
+                return Poll::Ready(Ok(0));
+            }
+            let mut kept = 0;
+            for i in 0..count {
+                self.decode(&mut bufs[i], &mut meta[i]);
+                if meta[i].len == 0 {
+                    continue;
+                }
+                if kept != i {
+                    let (before, after) = bufs.split_at_mut(i);
+                    before[kept][..meta[i].len].copy_from_slice(&after[0][..meta[i].len]);
+                    meta[kept] = meta[i];
+                }
+                kept += 1;
+            }
+            if kept != 0 {
+                return Poll::Ready(Ok(kept));
+            }
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+    fn max_transmit_segments(&self) -> usize {
+        self.socket.max_transmit_segments().min(32)
+    }
+    fn max_receive_segments(&self) -> usize {
+        self.socket.max_receive_segments()
+    }
+    fn may_fragment(&self) -> bool {
+        self.socket.may_fragment()
+    }
+}
+
+impl MaskedSocket {
+    fn decode(&self, buffer: &mut [u8], meta: &mut udp::RecvMeta) {
+        let wire_len = meta.len;
+        let stride = meta.stride;
+        meta.len = 0;
+        if stride <= SALT_LEN {
+            return;
+        }
+        // Each GRO segment has its own salt. Compact decoded payloads while
+        // retaining the segment stride, ECN, destination IP and source address.
+        meta.stride = stride - SALT_LEN;
+        for offset in (0..wire_len).step_by(stride) {
+            let end = (offset + stride).min(wire_len);
+            if self.mask.open_in_place(&mut buffer[offset..end]).is_ok() {
+                let len = end - offset - SALT_LEN;
+                buffer.copy_within(offset + SALT_LEN..end, meta.len);
+                meta.len += len;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::poll_fn;
+
+    fn socket() -> MaskedSocket {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        MaskedSocket::new(socket, b"test-password").unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn compact_receive_socket_preserves_datagrams() {
+        use std::os::fd::AsRawFd;
+        let raw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        raw.set_nonblocking(true).unwrap();
+        let descriptor = raw.as_raw_fd();
+        let wrapped = quinn::TokioRuntime.wrap_udp_socket(raw).unwrap();
+        let socket = ReceiveSocket::new(wrapped, descriptor, true);
+        let mut gro = 1i32;
+        let mut length = std::mem::size_of_val(&gro) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                descriptor,
+                libc::SOL_UDP,
+                libc::UDP_GRO,
+                (&mut gro as *mut i32).cast(),
+                &mut length,
+            )
+        };
+        if result == 0 {
+            assert_eq!(gro, 0);
+            assert_eq!(socket.max_receive_segments(), 1);
+        }
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for payload in [b"first".as_slice(), b"second", b"third"] {
+            sender
+                .send_to(payload, socket.local_addr().unwrap())
+                .unwrap();
+        }
+        let mut storage = [[0; 1472]; 4];
+        let mut bufs: Vec<_> = storage
+            .iter_mut()
+            .map(|data| IoSliceMut::new(data))
+            .collect();
+        let mut meta = [udp::RecvMeta::default(); 4];
+        let count = poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+        for (index, payload) in [b"first".as_slice(), b"second", b"third"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(&bufs[index][..meta[index].len], *payload);
+            assert_eq!(meta[index].addr, sender.local_addr().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn send_errors_are_packet_loss_instead_of_connection_failure() {
+        let socket = Arc::new(socket());
+        let mut poller = socket.clone().create_io_poller();
+        poll_fn(|cx| poller.as_mut().poll_writable(cx))
+            .await
+            .unwrap();
+        // Port zero produces EINVAL without transmitting a packet on Linux.
+        socket
+            .try_send(&udp::Transmit {
+                destination: "127.0.0.1:0".parse().unwrap(),
+                contents: b"test",
+                ecn: None,
+                segment_size: None,
+                src_ip: None,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gro_segments_have_independent_salts_and_preserve_metadata() {
+        let socket = socket();
+        let mut wire = Vec::new();
+        for payload in [b"first packet".as_slice(), b"next packet!", b"last"] {
+            let mut packet = Vec::new();
+            socket.mask.seal(payload, &mut packet).unwrap();
+            wire.extend_from_slice(&packet);
+        }
+        let mut meta = udp::RecvMeta {
+            addr: "127.0.0.1:1234".parse().unwrap(),
+            len: wire.len(),
+            stride: 12 + SALT_LEN,
+            ecn: Some(udp::EcnCodepoint::Ect0),
+            dst_ip: Some("127.0.0.2".parse().unwrap()),
+        };
+        socket.decode(&mut wire, &mut meta);
+        assert_eq!(&wire[..meta.len], b"first packetnext packet!last");
+        assert_eq!(meta.stride, 12);
+        assert_eq!(meta.ecn, Some(udp::EcnCodepoint::Ect0));
+        assert_eq!(meta.dst_ip, Some("127.0.0.2".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn segmented_send_is_wire_compatible_with_individual_salamander_packets() {
+        let sender = Arc::new(socket());
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut poller = sender.clone().create_io_poller();
+        let payload: Vec<_> = (0..(1200 * 3 + 17)).map(|i| (i % 251) as u8).collect();
+        let transmit = udp::Transmit {
+            destination: receiver.local_addr().unwrap(),
+            contents: &payload,
+            segment_size: Some(1200),
+            ecn: None,
+            src_ip: None,
+        };
+        loop {
+            poll_fn(|cx| poller.as_mut().poll_writable(cx))
+                .await
+                .unwrap();
+            match sender.try_send(&transmit) {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            let mut packet = [0; 2048];
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                receiver.recv(&mut packet),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            got.extend_from_slice(sender.mask.open_in_place(&mut packet[..n]).unwrap());
+        }
+        assert_eq!(got, payload);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn receives_a_batch_and_filters_short_packets() {
+        let socket = socket();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for payload in [b"a".as_slice(), b"short", b"b", b"c"] {
+            let mut packet = Vec::new();
+            if payload == b"short" {
+                packet.extend_from_slice(payload);
+            } else {
+                socket.mask.seal(payload, &mut packet).unwrap();
+            }
+            sender
+                .send_to(&packet, socket.local_addr().unwrap())
+                .unwrap();
+        }
+        let mut storage = [[0; 2048]; 4];
+        let mut bufs: Vec<_> = storage.iter_mut().map(|b| IoSliceMut::new(b)).collect();
+        let mut meta = [udp::RecvMeta::default(); 4];
+        let count = poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+        for i in 0..count {
+            assert_eq!(&bufs[i][..meta[i].len], &[b'a' + i as u8]);
+            assert_eq!(meta[i].addr, sender.local_addr().unwrap());
+        }
+    }
+}

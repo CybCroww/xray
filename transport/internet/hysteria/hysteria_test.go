@@ -7,11 +7,13 @@ import (
 	"errors"
 	"net"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/apernet/quic-go"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
 )
 
@@ -162,4 +164,124 @@ func TestDatagram(t *testing.T) {
 	})
 
 	cancel()
+}
+
+func TestParseUDPEnabled(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "true", want: true},
+		{value: "false", want: false},
+		{value: "", want: false},
+		{value: "invalid", want: false},
+	} {
+		if got := parseUDPEnabled(test.value); got != test.want {
+			t.Errorf("parseUDPEnabled(%q) = %v, want %v", test.value, got, test.want)
+		}
+	}
+}
+
+func TestStreamDispatcherAuthStateConcurrent(t *testing.T) {
+	handler := &httpHandler{}
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := range 1000 {
+			handler.Lock()
+			handler.auth = i%2 == 0
+			handler.user = &protocol.MemoryUser{}
+			handler.Unlock()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 1000 {
+			if _, err := handler.StreamDispatcher(0, nil, errors.New("ignored stream error")); err != nil {
+				t.Errorf("StreamDispatcher() error = %v", err)
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+func TestRetryIfInactiveRedialsOnce(t *testing.T) {
+	connectionStatus := StatusInactive
+	openCalls := 0
+	redialCalls := 0
+
+	got, err := retryIfInactive(
+		context.Background(),
+		func() status { return connectionStatus },
+		func(context.Context) error {
+			redialCalls++
+			connectionStatus = StatusActive
+			return nil
+		},
+		func() (int, error) {
+			openCalls++
+			if openCalls == 1 {
+				return 0, errors.New("stale connection")
+			}
+			return 42, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 42 {
+		t.Fatalf("open result = %d, want 42", got)
+	}
+	if openCalls != 2 || redialCalls != 1 {
+		t.Fatalf("open calls = %d, redial calls = %d; want 2 and 1", openCalls, redialCalls)
+	}
+}
+
+func TestRetryIfInactiveDoesNotRedialLiveConnection(t *testing.T) {
+	streamLimitErr := &quic.StreamLimitReachedError{}
+	openCalls := 0
+	redialCalls := 0
+
+	_, err := retryIfInactive(
+		context.Background(),
+		func() status { return StatusActive },
+		func(context.Context) error {
+			redialCalls++
+			return nil
+		},
+		func() (int, error) {
+			openCalls++
+			return 0, streamLimitErr
+		},
+	)
+	if err != streamLimitErr {
+		t.Fatalf("open error = %v, want original stream-limit error", err)
+	}
+	if openCalls != 1 || redialCalls != 0 {
+		t.Fatalf("open calls = %d, redial calls = %d; want 1 and 0", openCalls, redialCalls)
+	}
+}
+
+func TestRetryIfInactiveReturnsRedialError(t *testing.T) {
+	dialErr := errors.New("redial failed")
+	openCalls := 0
+
+	_, err := retryIfInactive(
+		context.Background(),
+		func() status { return StatusInactive },
+		func(context.Context) error { return dialErr },
+		func() (int, error) {
+			openCalls++
+			return 0, errors.New("stale connection")
+		},
+	)
+	if err != dialErr {
+		t.Fatalf("retry error = %v, want redial error", err)
+	}
+	if openCalls != 1 {
+		t.Fatalf("open calls = %d, want 1", openCalls)
+	}
 }

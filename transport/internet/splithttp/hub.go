@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -26,6 +27,7 @@ import (
 	http_proto "github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/handoff"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/reality"
@@ -40,6 +42,8 @@ type requestHandler struct {
 	ln             *Listener
 	sessionMu      *sync.Mutex
 	sessions       sync.Map
+	peer           atomic.Pointer[handoffPeer]
+	life           *handoffLifetime
 	localAddr      net.Addr
 	socketSettings *internet.SocketConfig
 }
@@ -49,18 +53,8 @@ type httpSession struct {
 	reapTimer   *time.Timer
 }
 
-func (h *requestHandler) upsertSession(sessionId string) *httpSession {
-	// fast path
+func (h *requestHandler) upsertSessionLocked(sessionId string) *httpSession {
 	currentSessionAny, ok := h.sessions.Load(sessionId)
-	if ok {
-		return currentSessionAny.(*httpSession)
-	}
-
-	// slow path
-	h.sessionMu.Lock()
-	defer h.sessionMu.Unlock()
-
-	currentSessionAny, ok = h.sessions.Load(sessionId)
 	if ok {
 		return currentSessionAny.(*httpSession)
 	}
@@ -68,19 +62,40 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 	s := &httpSession{
 		uploadQueue: NewUploadQueue(h.ln.config.GetNormalizedScMaxBufferedPosts()),
 	}
+	if h.life != nil {
+		h.life.addSession()
+	}
 
 	s.reapTimer = time.AfterFunc(30*time.Second, func() {
 		h.sessionMu.Lock()
-		h.sessions.CompareAndDelete(sessionId, s)
-		h.sessionMu.Unlock()
-		s.uploadQueue.Close()
+		defer h.sessionMu.Unlock()
+		if h.removeSession(sessionId, s) {
+			s.uploadQueue.Close()
+		}
 	})
 	h.sessions.Store(sessionId, s)
 
 	return s
 }
 
+func (h *requestHandler) removeSession(id string, session *httpSession) bool {
+	if !h.sessions.CompareAndDelete(id, session) {
+		return false
+	}
+	if h.life != nil {
+		h.life.exit()
+	}
+	return true
+}
+
 func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if h.life != nil {
+		if !h.life.enter() {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		defer h.life.exit()
+	}
 	if len(h.host) > 0 && !internet.IsValidHTTPHost(request.Host, h.host) {
 		errors.LogInfo(context.Background(), "failed to validate host, request:", request.Host, ", config:", h.host)
 		writer.WriteHeader(http.StatusNotFound)
@@ -146,12 +161,13 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		return
 	}
 
+	currentSession, handled := h.resolveSession(writer, request, sessionId)
+	if handled {
+		return
+	}
+
 	var err error
 
-	var currentSession *httpSession
-	if sessionId != "" {
-		currentSession = h.upsertSession(sessionId)
-	}
 	scMaxEachPostBytes := int(h.ln.config.GetNormalizedScMaxEachPostBytes().To)
 	isUplinkRequest := false
 
@@ -333,7 +349,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
 			currentSession.reapTimer.Stop()
-			defer h.sessions.CompareAndDelete(sessionId, currentSession)
+			defer h.removeSession(sessionId, currentSession)
 		}
 
 		// magic header instructs nginx + apache to not buffer response body
@@ -492,6 +508,11 @@ type Listener struct {
 	listener   net.Listener
 	h3listener http3.QUICListener
 	config     *Config
+	handler    *requestHandler
+	peerServer *http.Server
+	peerSocket net.Listener
+	peerPath   string
+	peerDigest string
 	addConn    internet.ConnHandler
 	isH3       bool
 }
@@ -515,8 +536,16 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		sessions:       sync.Map{},
 		socketSettings: streamSettings.SocketSettings,
 	}
+	l.handler = handler
 	tlsConfig := getTLSConfig(streamSettings)
 	l.isH3 = len(tlsConfig.NextProtos) == 1 && tlsConfig.NextProtos[0] == "h3"
+	inherited := handoff.TCPListenerFromContext(ctx)
+	if inherited != nil {
+		if l.isH3 {
+			return nil, errors.New("XHTTP/3 is not a managed stream listener")
+		}
+		handler.life = newHandoffLifetime()
+	}
 
 	var err error
 	if l.isH3 {
@@ -585,7 +614,12 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		} else { // tcp
 			addr = &net.TCPAddr{IP: address.IP(), Port: int(port)}
 		}
-		if streamSettings.FinalMask != nil {
+		if inherited != nil {
+			l.listener = inherited
+			if addr.Network() == "unix" {
+				l.listener = &inheritedUnixListener{inherited}
+			}
+		} else if streamSettings.FinalMask != nil {
 			l.listener, err = streamSettings.FinalMask.Listen(ctx, addr)
 		} else {
 			l.listener, err = internet.ListenSystem(ctx, addr, streamSettings.SocketSettings)
@@ -613,6 +647,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		if len(l.config.H2Params) > 0 {
 			http2Config = new(http.HTTP2Config)
 			if err := json.Unmarshal(l.config.H2Params, http2Config); err != nil {
+				l.listener.Close()
 				return nil, errors.New("failed to parse HTTP2Config").Base(err)
 			}
 		}
@@ -651,12 +686,33 @@ func (ln *Listener) Addr() net.Addr {
 
 // Close implements net.Listener.Close().
 func (ln *Listener) Close() error {
+	if ln.handler.life != nil {
+		ln.handler.life.close()
+		if ln.peerServer != nil {
+			ln.peerServer.Close()
+			ln.peerSocket.Close()
+		}
+		ln.server.Close()
+		// The server may close before its Serve goroutine registered the socket.
+		ln.listener.Close()
+		return nil
+	}
 	if ln.h3server != nil {
 		return ln.h3server.Close()
 	} else if ln.listener != nil {
 		return ln.listener.Close()
 	}
 	return errors.New("listener does not have an HTTP/3 server or a net.listener")
+}
+
+type inheritedUnixListener struct{ net.Listener }
+
+func (l *inheritedUnixListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &internet.UnixConnWrapper{UnixConn: conn.(*net.UnixConn)}, nil
 }
 
 func getTLSConfig(streamSettings *internet.MemoryStreamConfig) *gotls.Config {
