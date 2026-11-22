@@ -23,11 +23,12 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	hyproxy "github.com/xtls/xray-core/proxy/hysteria"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
+	native "github.com/xtls/xray-core/transport/internet/xhysteria"
 )
 
 func TestNativeServerUserLimitAndAccounting(t *testing.T) {
 	// A Go client exercises the native server's authenticated DispatchLink path.
-	t.Setenv("XRAY_HYSTERIA_NATIVE", "0")
+	t.Setenv("XRAY_HYSTERIA_NATIVE", "server")
 	file := filepath.Join(t.TempDir(), "limits.json")
 	if err := os.WriteFile(file, []byte(`{"version":1,"users":{"458":{"uplinkBytesPerSecond":131072,"downlinkBytesPerSecond":131072}}}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -35,11 +36,15 @@ func TestNativeServerUserLimitAndAccounting(t *testing.T) {
 	old := userlimit.Default
 	userlimit.Default = userlimit.New(file)
 	t.Cleanup(func() { userlimit.Default = old })
+	engines := native.Stats().StartedEngines
 	server, caPath, instance := xrayServerWithConfig(t, true, func(c *core.Config) {
 		nativeServerConfig(t, c, false)
 		c.Inbound[0].ProxySettings = serial.ToTypedMessage(&hyproxy.ServerConfig{Users: []*protocol.User{{Email: "458", Account: serial.ToTypedMessage(&account.Account{Auth: auth})}}})
 		c.App = append(c.App, serial.ToTypedMessage(&apppolicy.Config{Level: map[uint32]*apppolicy.Policy{0: {Stats: &apppolicy.Policy_Stats{UserUplink: true, UserDownlink: true, UserOnline: true}}}}), serial.ToTypedMessage(&appstats.Config{}))
 	})
+	if native.Stats().StartedEngines != engines+1 {
+		t.Fatal("native server was not selected")
+	}
 	ca, err := os.ReadFile(caPath)
 	if err != nil {
 		t.Fatal(err)

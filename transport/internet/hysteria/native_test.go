@@ -429,3 +429,24 @@ func TestNativeStringMasquerade(t *testing.T) {
 		}
 	}
 }
+
+func TestNativeServerOnlySelection(t *testing.T) {
+	for _, mode := range []string{"", "0", "1", "server"} {
+		for _, explicit := range []bool{false, true} {
+			t.Setenv("XRAY_HYSTERIA_NATIVE", mode)
+			settings := &internet.MemoryStreamConfig{ProtocolSettings: &Config{Native: explicit}}
+			client, server := explicit, explicit
+			switch mode {
+			case "0":
+				client, server = false, false
+			case "1":
+				client, server = true, true
+			case "server":
+				client, server = false, true
+			}
+			if nativeRequested(settings) != client || nativeRequestedForRole(settings, true) != server {
+				t.Fatalf("wrong native selection for %q with explicit=%v", mode, explicit)
+			}
+		}
+	}
+}

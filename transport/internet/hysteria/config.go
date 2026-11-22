@@ -64,11 +64,17 @@ func ContextWithNativeTarget(ctx context.Context, target net.Destination) contex
 }
 
 func nativeRequested(settings *internet.MemoryStreamConfig) bool {
+	return nativeRequestedForRole(settings, false)
+}
+
+func nativeRequestedForRole(settings *internet.MemoryStreamConfig, server bool) bool {
 	switch os.Getenv("XRAY_HYSTERIA_NATIVE") {
 	case "0":
 		return false
 	case "1":
 		return true
+	case "server":
+		return server
 	}
 	config, _ := settings.ProtocolSettings.(*Config)
 	return config.GetNative()

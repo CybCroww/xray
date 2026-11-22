@@ -14,12 +14,14 @@ import (
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/core"
+	native "github.com/xtls/xray-core/transport/internet/xhysteria"
 )
 
 func TestNativeServerWithDefaultQuicParams(t *testing.T) {
 	for _, masked := range []bool{false, true} {
 		t.Run(map[bool]string{false: "plain", true: "salamander"}[masked], func(t *testing.T) {
-			t.Setenv("XRAY_HYSTERIA_NATIVE", "0")
+			t.Setenv("XRAY_HYSTERIA_NATIVE", "server")
+			engines := native.Stats().StartedEngines
 			server, caPath, _ := xrayServerWithConfig(t, masked, func(c *core.Config) {
 				nativeServerConfig(t, c, false)
 				raw, err := c.Inbound[0].ReceiverSettings.GetInstance()
@@ -30,6 +32,9 @@ func TestNativeServerWithDefaultQuicParams(t *testing.T) {
 				receiver.StreamSettings.QuicParams = nil
 				c.Inbound[0].ReceiverSettings = serial.ToTypedMessage(receiver)
 			})
+			if native.Stats().StartedEngines != engines+1 {
+				t.Fatal("native server was not selected")
+			}
 			ca, err := os.ReadFile(caPath)
 			if err != nil {
 				t.Fatal(err)
