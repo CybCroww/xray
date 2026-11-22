@@ -115,7 +115,7 @@ jobs:
         run: |
           bash native/libxhysteria/link-go.sh native/libxhysteria/target/release objcopy \
             go test -race -tags 'xhysteria_native xhysteria_interop' ./native/libxhysteria/interop \
-            -run '^(TestNativeServerUserLimitAndAccounting|TestEmbeddedNativeServer|TestEmbeddedNativeOutbound|TestGoOutboundAgainstEmbeddedServer|TestNativeServerDynamicUsers|TestNativeShortFlowsReturnQUICStreamCapacity|TestNativeSingleQUICSessionRecyclesClosedStreams)$' \
+            -run '^(TestNativeServerWithDefaultQuicParams|TestNativeServerUserLimitAndAccounting|TestEmbeddedNativeServer|TestEmbeddedNativeOutbound|TestGoOutboundAgainstEmbeddedServer|TestNativeServerDynamicUsers|TestNativeShortFlowsReturnQUICStreamCapacity|TestNativeSingleQUICSessionRecyclesClosedStreams)$' \
             -count=1 -timeout 5m
       - name: Upload native Linux binary
         uses: actions/upload-artifact@v7

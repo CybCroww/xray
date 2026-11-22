@@ -37,13 +37,21 @@ import (
 )
 
 func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) {
+	return nativeConfigForRole(settings, false)
+}
+
+func nativeConfigForRole(settings *internet.MemoryStreamConfig, server bool) (native.Config, error) {
 	var c native.Config
 	t := tls.ConfigFromStreamSettings(settings)
 	if t == nil {
 		return c, fmt.Errorf("native Hysteria requires TLS")
 	}
 	q := settings.QuicParams
-	if q == nil || !q.DisableChromeParrot {
+	if q == nil {
+		q = new(internet.QuicParams)
+	}
+	// ChromeParrot shapes the client's handshake, not a listening server.
+	if !server && !q.DisableChromeParrot {
 		return c, fmt.Errorf("native prototype requires quicParams.disableChromeParrot=true")
 	}
 	if q.BbrProfile != "" && q.BbrProfile != "standard" {
@@ -587,7 +595,7 @@ type nativeInbound struct {
 func (c *nativeInbound) User() *protocol.MemoryUser { return c.user }
 
 func nativeListen(ctx context.Context, address net.Address, port net.Port, settings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
-	config, err := nativeConfig(settings)
+	config, err := nativeConfigForRole(settings, true)
 	if err != nil {
 		return nil, err
 	}

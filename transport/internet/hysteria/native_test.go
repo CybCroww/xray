@@ -21,6 +21,22 @@ import (
 	native "github.com/xtls/xray-core/transport/internet/xhysteria"
 )
 
+func TestNativeServerQuicDefaults(t *testing.T) {
+	for _, params := range []*internet.QuicParams{nil, {}, {DisableChromeParrot: true}} {
+		settings := &internet.MemoryStreamConfig{SecuritySettings: &tls.Config{}, QuicParams: params}
+		if _, err := nativeConfigForRole(settings, true); err != nil {
+			t.Fatalf("server defaults rejected: %v", err)
+		}
+		_, err := nativeConfig(settings)
+		if (err == nil) != (params != nil && params.DisableChromeParrot) {
+			t.Fatal("native client fingerprint requirement changed")
+		}
+		if settings.QuicParams != params {
+			t.Fatal("server configuration mutated shared QUIC parameters")
+		}
+	}
+}
+
 func TestNativeServerResourceLimits(t *testing.T) {
 	for _, test := range []struct {
 		name      string
