@@ -94,6 +94,7 @@ func executeRun(cmd *base.Command, args []string) {
 
 	if err := server.Start(); err != nil {
 		fmt.Println("Failed to start:", err)
+		server.Close()
 		os.Exit(-1)
 	}
 	defer server.Close()

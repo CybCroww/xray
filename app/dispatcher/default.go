@@ -13,6 +13,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/userlimit"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/outbound"
@@ -182,6 +183,12 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		if p.Stats.UserOnline {
 			trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
 		}
+		if userlimit.Default != nil {
+			// Existing raw streams must not bypass a limit enabled after their handshake.
+			sessionInbound.CanSpliceCopy = 3
+			inboundLink.Writer = userlimit.NewWriter(ctx, userlimit.Default, user.Email, userlimit.Uplink, inboundLink.Writer)
+			outboundLink.Writer = userlimit.NewWriter(ctx, userlimit.Default, user.Email, userlimit.Downlink, outboundLink.Writer)
+		}
 	}
 
 	return inboundLink, outboundLink
@@ -215,6 +222,12 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 		}
 		if p.Stats.UserOnline {
 			trackOnlineIP(ctx, statsManager, user.Email, sessionInbound.Source.Address.String())
+		}
+		if userlimit.Default != nil {
+			sessionInbound.CanSpliceCopy = 3
+			reader := link.Reader.(*buf.TimeoutWrapperReader)
+			reader.Reader = userlimit.NewReader(ctx, userlimit.Default, user.Email, reader.Reader)
+			link.Writer = userlimit.NewWriter(ctx, userlimit.Default, user.Email, userlimit.Downlink, link.Writer)
 		}
 	}
 

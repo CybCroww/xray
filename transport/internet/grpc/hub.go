@@ -101,32 +101,32 @@ func Listen(ctx context.Context, address net.Address, port net.Port, settings *i
 		errors.LogWarning(ctx, "accepting PROXY protocol")
 	}
 
+	var streamListener net.Listener
+	var err error
+	var addr net.Addr
+	if port == net.Port(0) { // unix
+		addr = &net.UnixAddr{Name: address.Domain(), Net: "unix"}
+	} else { // tcp
+		addr = &net.TCPAddr{IP: address.IP(), Port: int(port)}
+	}
+	if settings.FinalMask != nil {
+		streamListener, err = settings.FinalMask.Listen(ctx, addr)
+	} else {
+		streamListener, err = internet.ListenSystem(ctx, addr, settings.SocketSettings)
+	}
+	if err != nil {
+		s.Stop()
+		return nil, errors.New("failed to listen on ", address, ":", port).Base(err)
+	}
+
+	errors.LogDebug(ctx, "gRPC listen for service name `"+grpcSettings.getServiceName()+"` tun `"+grpcSettings.getTunStreamName()+"` multi tun `"+grpcSettings.getTunMultiStreamName()+"`")
+	encoding.RegisterGRPCServiceServerX(s, listener, grpcSettings.getServiceName(), grpcSettings.getTunStreamName(), grpcSettings.getTunMultiStreamName())
+
+	if config := reality.ConfigFromStreamSettings(settings); config != nil {
+		streamListener = goreality.NewListener(streamListener, config.GetREALITYConfig())
+	}
 	go func() {
-		var streamListener net.Listener
-		var err error
-		var addr net.Addr
-		if port == net.Port(0) { // unix
-			addr = &net.UnixAddr{Name: address.Domain(), Net: "unix"}
-		} else { // tcp
-			addr = &net.TCPAddr{IP: address.IP(), Port: int(port)}
-		}
-		if settings.FinalMask != nil {
-			streamListener, err = settings.FinalMask.Listen(ctx, addr)
-		} else {
-			streamListener, err = internet.ListenSystem(ctx, addr, settings.SocketSettings)
-		}
-		if err != nil {
-			errors.LogErrorInner(ctx, err, "failed to listen on ", address, ":", port)
-			return
-		}
-
-		errors.LogDebug(ctx, "gRPC listen for service name `"+grpcSettings.getServiceName()+"` tun `"+grpcSettings.getTunStreamName()+"` multi tun `"+grpcSettings.getTunMultiStreamName()+"`")
-		encoding.RegisterGRPCServiceServerX(s, listener, grpcSettings.getServiceName(), grpcSettings.getTunStreamName(), grpcSettings.getTunMultiStreamName())
-
-		if config := reality.ConfigFromStreamSettings(settings); config != nil {
-			streamListener = goreality.NewListener(streamListener, config.GetREALITYConfig())
-		}
-		if err = s.Serve(streamListener); err != nil {
+		if err := s.Serve(streamListener); err != nil {
 			errors.LogInfoInner(ctx, err, "Listener for gRPC ended")
 		}
 	}()

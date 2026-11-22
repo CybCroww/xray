@@ -91,10 +91,10 @@ func (h *HunkReaderWriter) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		}
 	}
 
-	if cap(h.buf) >= buf.Size {
-		b := h.buf
+	if len(h.buf) == buf.Size {
+		b := h.buf[h.index:]
 		h.index = len(h.buf)
-		return buf.MultiBuffer{buf.NewExisted(b)}, nil
+		return buf.MultiBuffer{buf.FromBytes(b)}, nil
 	}
 
 	b := buf.New()

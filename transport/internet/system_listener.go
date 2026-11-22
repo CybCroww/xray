@@ -57,11 +57,12 @@ func (l *UnixListenerWrapper) Accept() (net.Conn, error) {
 }
 
 func (l *UnixListenerWrapper) Close() error {
+	err := l.UnixListener.Close()
 	if l.locker != nil {
 		l.locker.Release()
 		l.locker = nil
 	}
-	return l.UnixListener.Close()
+	return err
 }
 
 type UnixConnWrapper struct {
