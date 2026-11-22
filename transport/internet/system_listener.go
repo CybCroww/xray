@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,7 +46,8 @@ func getControlFunc(ctx context.Context, sockopt *SocketConfig, controllers []fu
 // If other issues encountered, we should able to fix it here.
 type UnixListenerWrapper struct {
 	*net.UnixListener
-	locker *FileLocker
+	locker   *FileLocker
+	lockerMu sync.Mutex
 }
 
 func (l *UnixListenerWrapper) Accept() (net.Conn, error) {
@@ -58,6 +60,8 @@ func (l *UnixListenerWrapper) Accept() (net.Conn, error) {
 
 func (l *UnixListenerWrapper) Close() error {
 	err := l.UnixListener.Close()
+	l.lockerMu.Lock()
+	defer l.lockerMu.Unlock()
 	if l.locker != nil {
 		l.locker.Release()
 		l.locker = nil
