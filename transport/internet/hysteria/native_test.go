@@ -89,7 +89,7 @@ func TestNativeMemoryLimitParsing(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := t.TempDir() + "/memory.limit"
-			if err := os.WriteFile(path, []byte(test.data), 0600); err != nil {
+			if err := os.WriteFile(path, []byte(test.data), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if got := nativeMemoryLimit(path, 1<<60); got != test.want {
@@ -102,7 +102,7 @@ func TestNativeMemoryLimitParsing(t *testing.T) {
 func TestNativeMemoryLimitIncludesParentSlices(t *testing.T) {
 	root := t.TempDir()
 	group := filepath.Join("danvless.slice", "dataplane.slice", "xray.service")
-	if err := os.MkdirAll(filepath.Join(root, group), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Join(root, group), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	for _, entry := range []struct{ path, value string }{
@@ -111,7 +111,7 @@ func TestNativeMemoryLimitIncludesParentSlices(t *testing.T) {
 		{"danvless.slice/dataplane.slice/memory.max", "805306368"},
 		{group + "/memory.max", "max"},
 	} {
-		if err := os.WriteFile(filepath.Join(root, entry.path), []byte(entry.value), 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(root, entry.path), []byte(entry.value), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}

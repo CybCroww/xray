@@ -425,7 +425,7 @@ func serveBrokerCommands(ctx context.Context, path string, command func(context.
 		return err
 	}
 	defer listener.Close()
-	if err := os.Chmod(path, 0600); err != nil {
+	if err := os.Chmod(path, 0o600); err != nil {
 		return err
 	}
 	stop := context.AfterFunc(ctx, func() { listener.Close() })

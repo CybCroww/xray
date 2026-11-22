@@ -145,7 +145,7 @@ func (s *supervisor) startBroker(config []byte) error {
 		return nil
 	}
 	directory := filepath.Join(s.root, "broker")
-	if err := os.Mkdir(directory, 0700); err != nil {
+	if err := os.Mkdir(directory, 0o700); err != nil {
 		return err
 	}
 	path := filepath.Join(directory, "manifest.json")

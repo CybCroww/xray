@@ -31,7 +31,7 @@ func TestSupervisorPublicRealityProbe(t *testing.T) {
 	defer cancel()
 	root := socketRoot(t)
 	runtime := filepath.Join(root, "run")
-	if err := os.Mkdir(runtime, 0700); err != nil {
+	if err := os.Mkdir(runtime, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	decoy := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) }))
@@ -59,9 +59,11 @@ func TestSupervisorPublicRealityProbe(t *testing.T) {
 		inbounds = append(inbounds, map[string]any{
 			"tag": network, "listen": "127.0.0.1", "port": freePort(), "protocol": "vless",
 			"settings": map[string]any{"decryption": "none", "clients": []any{map[string]any{"id": "11111111-1111-4111-8111-111111111111", "email": "existing@invalid"}}},
-			"streamSettings": map[string]any{"network": network, "security": "reality",
+			"streamSettings": map[string]any{
+				"network": network, "security": "reality",
 				"realitySettings":    map[string]any{"target": decoy.Listener.Addr().String(), "serverNames": []string{"localhost"}, "shortIds": []string{"1234567890abcdef"}, "privateKey": base64.RawURLEncoding.EncodeToString(key.Bytes())},
-				network + "Settings": map[string]any{"serviceName": "probe", "path": "/probe/", "mode": "auto"}},
+				network + "Settings": map[string]any{"serviceName": "probe", "path": "/probe/", "mode": "auto"},
+			},
 		})
 	}
 	host, port, err := net.SplitHostPort(response.Listener.Addr().String())
@@ -78,7 +80,7 @@ func TestSupervisorPublicRealityProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, "config.json")
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s, err := newSupervisor(ctx, runtime, probe, release{binary, path})

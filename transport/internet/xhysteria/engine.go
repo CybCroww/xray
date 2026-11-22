@@ -335,8 +335,10 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 			maxFlows = 64
 		}
 	}
-	e := &Engine{handle: handle, bridge: bridge, arenaBytes: arenaBytes, local: local, remote: remote, flows: make(map[uint64]*Conn), out: make(chan frame, 128), done: make(chan struct{}), accept: accept,
-		authenticate: config.Authenticate, authUsers: make(map[uint64]nativeIdentity), controls: make(map[uint64]chan frame), maxFlows: maxFlows, diagnostic: config.Diagnostic, role: "client", peer: config.Peer}
+	e := &Engine{
+		handle: handle, bridge: bridge, arenaBytes: arenaBytes, local: local, remote: remote, flows: make(map[uint64]*Conn), out: make(chan frame, 128), done: make(chan struct{}), accept: accept,
+		authenticate: config.Authenticate, authUsers: make(map[uint64]nativeIdentity), controls: make(map[uint64]chan frame), maxFlows: maxFlows, diagnostic: config.Diagnostic, role: "client", peer: config.Peer,
+	}
 	e.masquerade = config.MasqueradeHandler
 	if config.Server {
 		e.role = "server"

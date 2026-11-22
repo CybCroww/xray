@@ -39,7 +39,7 @@ func TestNativeCertificateWatcherWaitsForMatchingKeyPair(t *testing.T) {
 	certPath, keyPath := filepath.Join(t.TempDir(), "cert.pem"), filepath.Join(t.TempDir(), "key.pem")
 	write := func(path string, data []byte) {
 		t.Helper()
-		if err := os.WriteFile(path, data, 0600); err != nil {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}

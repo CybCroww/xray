@@ -29,7 +29,7 @@ func TestNativeServerUserLimitAndAccounting(t *testing.T) {
 	// A Go client exercises the native server's authenticated DispatchLink path.
 	t.Setenv("XRAY_HYSTERIA_NATIVE", "0")
 	file := filepath.Join(t.TempDir(), "limits.json")
-	if err := os.WriteFile(file, []byte(`{"version":1,"users":{"458":{"uplinkBytesPerSecond":131072,"downlinkBytesPerSecond":131072}}}`), 0600); err != nil {
+	if err := os.WriteFile(file, []byte(`{"version":1,"users":{"458":{"uplinkBytesPerSecond":131072,"downlinkBytesPerSecond":131072}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	old := userlimit.Default

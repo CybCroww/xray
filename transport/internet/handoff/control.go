@@ -44,7 +44,7 @@ func ListenControl(path string, g *Generation) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(path, 0600); err != nil {
+	if err := os.Chmod(path, 0o600); err != nil {
 		listener.Close()
 		return nil, err
 	}
@@ -68,7 +68,7 @@ func PrivateSocketDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	if !directory.IsDir() || directory.Mode().Perm() != 0700 {
+	if !directory.IsDir() || directory.Mode().Perm() != 0o700 {
 		return errors.New("handoff sockets require a private directory (0700)")
 	}
 	return nil

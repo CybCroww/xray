@@ -20,8 +20,15 @@ func TestNativeClientWorkerBudget(t *testing.T) {
 		value string
 		want  uint8
 	}{
-		{"", 4}, {"0", 4}, {"1", 1}, {"4", 4}, {"8", 8}, {"16", 16},
-		{"-1", 0}, {"17", 0}, {"many", 0},
+		{"", 4},
+		{"0", 4},
+		{"1", 1},
+		{"4", 4},
+		{"8", 8},
+		{"16", 16},
+		{"-1", 0},
+		{"17", 0},
+		{"many", 0},
 	} {
 		t.Run(test.value, func(t *testing.T) {
 			t.Setenv("XRAY_HYSTERIA_CLIENT_WORKERS", test.value)

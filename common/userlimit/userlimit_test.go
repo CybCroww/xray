@@ -20,7 +20,7 @@ func save(t *testing.T, m *Manager, users map[string]Limit) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = os.WriteFile(m.path+".new", data, 0600); err != nil {
+	if err = os.WriteFile(m.path+".new", data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err = os.Rename(m.path+".new", m.path); err != nil {
@@ -87,7 +87,7 @@ func TestCancellationDoesNotReserveFutureBudget(t *testing.T) {
 func TestInvalidFilesRetainLastValidLimits(t *testing.T) {
 	m := manager(t, 125000)
 	for _, data := range []string{`{`, `{"version":2,"users":{}}`, `{"version":1,"users":{"458":{"downlinkBytesPerSecond":-1}}}`, `{"version":1,"users":{},"typo":1}`, `{"version":1,"users":{}}{}`} {
-		if err := os.WriteFile(m.path, []byte(data), 0600); err != nil {
+		if err := os.WriteFile(m.path, []byte(data), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		m.next.Store(0)
@@ -120,7 +120,7 @@ func TestConfigIsBounded(t *testing.T) {
 	if len(m.config.Load().Users) != 1 {
 		t.Fatal("unbounded account map accepted")
 	}
-	if err := os.WriteFile(m.path, make([]byte, maxFile+1), 0600); err != nil {
+	if err := os.WriteFile(m.path, make([]byte, maxFile+1), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	m.next.Store(0)

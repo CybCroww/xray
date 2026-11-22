@@ -67,7 +67,7 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 	certificatePEM, keyPEM := certificate.ToPEM()
 	certPath, keyPath := filepath.Join(root, "cert.pem"), filepath.Join(root, "key.pem")
 	for path, data := range map[string][]byte{certPath: certificatePEM, keyPath: keyPEM} {
-		if err := os.WriteFile(path, data, 0600); err != nil {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -144,13 +144,13 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 	var controls []handoff.ControlSocket
 	start := func(slot byte) {
 		directory := filepath.Join(root, strconv.Itoa(int(slot)))
-		if err := os.Mkdir(directory, 0700); err != nil {
+		if err := os.Mkdir(directory, 0o700); err != nil {
 			t.Fatal(err)
 		}
 		config := fmt.Sprintf(`{"log":{"loglevel":"warning"},"inbounds":[{"tag":"hy","listen":"127.0.0.1","port":%d,"protocol":"hysteria","settings":{"users":[{"auth":%q}]},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"native":%t},"tlsSettings":{"certificates":[{"certificateFile":%q,"keyFile":%q,"oneTimeLoading":true}]},"finalmask":{"quicParams":{"disableChromeParrot":true},"udp":[{"type":"salamander","settings":{"password":%q}},{"type":"mkcp-legacy","settings":{"header":"wireguard"}}]}}}],"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.1/32"]}]}}]}`,
 			local.Port, auth, os.Getenv("XHYS_HANDOFF_BACKEND") != "go", certPath, keyPath, psk)
 		configPath := filepath.Join(directory, "config.json")
-		if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+		if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		arguments := []string{"run", "-config", configPath}
@@ -184,8 +184,10 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 					file.Close()
 				}
 			}()
-			manifest := handoff.Manifest{Control: string(control), UDP: []handoff.UDPBinding{{Tag: "hy", Address: "127.0.0.1", Port: local.Port, FD: 3, Key: key, Slot: slot,
-				PacketBatch: os.Getenv("XHYS_HANDOFF_PACKET_BATCH") == "1"}}}
+			manifest := handoff.Manifest{Control: string(control), UDP: []handoff.UDPBinding{{
+				Tag: "hy", Address: "127.0.0.1", Port: local.Port, FD: 3, Key: key, Slot: slot,
+				PacketBatch: os.Getenv("XHYS_HANDOFF_PACKET_BATCH") == "1",
+			}}}
 			if len(inherited) == 4 {
 				manifest.UDP[0].RingFDs = []int{4, 5, 6}
 			}
@@ -203,7 +205,7 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 			}
 			data, _ := json.Marshal(manifest)
 			manifestPath := filepath.Join(directory, "manifest.json")
-			if err := os.WriteFile(manifestPath, data, 0600); err != nil {
+			if err := os.WriteFile(manifestPath, data, 0o600); err != nil {
 				t.Fatal(err)
 			}
 			arguments = append(arguments, "-handoff-manifest", manifestPath)

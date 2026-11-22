@@ -1,9 +1,10 @@
 package handoff
 
 import (
-	"golang.org/x/sys/unix"
 	"os"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestStartupRequiresExplicitCommit(t *testing.T) {

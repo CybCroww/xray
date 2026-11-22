@@ -165,7 +165,8 @@ func ImportPacketEndpoint(fd *os.File, local net.UDPAddr) (*PacketEndpoint, erro
 // description. net.Conn.File().Fd() may make another live Go reader block.
 func DuplicatePacketSocket(socket interface {
 	SyscallConn() (syscall.RawConn, error)
-}) (*os.File, error) {
+},
+) (*os.File, error) {
 	raw, err := socket.SyscallConn()
 	if err != nil {
 		return nil, err

@@ -102,14 +102,16 @@ func (l *Listener) StartHandoff(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Chmod(path, 0600); err != nil {
+	if err := os.Chmod(path, 0o600); err != nil {
 		socket.Close()
 		return err
 	}
 	protocols := new(http.Protocols)
 	protocols.SetUnencryptedHTTP2(true)
-	l.peerServer = &http.Server{Handler: l.HandoffHandler(), Protocols: protocols, ReadHeaderTimeout: 4 * time.Second,
-		MaxHeaderBytes: l.config.GetNormalizedServerMaxHeaderBytes()}
+	l.peerServer = &http.Server{
+		Handler: l.HandoffHandler(), Protocols: protocols, ReadHeaderTimeout: 4 * time.Second,
+		MaxHeaderBytes: l.config.GetNormalizedServerMaxHeaderBytes(),
+	}
 	l.peerSocket = socket
 	l.peerDigest = hex.EncodeToString(digest[:])
 	go l.peerServer.Serve(socket)
@@ -127,7 +129,7 @@ func (l *Listener) LinkHandoffPeer(path string) error {
 	if err != nil {
 		return err
 	}
-	if info.Mode().Type() != os.ModeSocket || info.Mode().Perm() != 0600 {
+	if info.Mode().Type() != os.ModeSocket || info.Mode().Perm() != 0o600 {
 		return errors.New("invalid private XHTTP peer socket")
 	}
 	probe := newHandoffPeer(path, false)

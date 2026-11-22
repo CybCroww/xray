@@ -25,7 +25,7 @@ func saveGlobal(t *testing.T, m *Manager, broker *brokerConfig, rate int64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = os.WriteFile(m.path, data, 0600); err != nil {
+	if err = os.WriteFile(m.path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	m.next.Store(0)

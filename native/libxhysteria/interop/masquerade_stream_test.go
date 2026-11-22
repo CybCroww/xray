@@ -144,13 +144,13 @@ func TestEmbeddedHTTPFileMasquerade(t *testing.T) {
 					t.Setenv("XRAY_HYSTERIA_BRIDGE", bridge)
 					directory := t.TempDir()
 					payload := bytes.Repeat([]byte("streamed native masquerade file\n"), 65536)
-					if err := os.WriteFile(filepath.Join(directory, "large.txt"), payload, 0600); err != nil {
+					if err := os.WriteFile(filepath.Join(directory, "large.txt"), payload, 0o600); err != nil {
 						t.Fatal(err)
 					}
-					if err := os.Mkdir(filepath.Join(directory, "site"), 0700); err != nil {
+					if err := os.Mkdir(filepath.Join(directory, "site"), 0o700); err != nil {
 						t.Fatal(err)
 					}
-					if err := os.WriteFile(filepath.Join(directory, "site", "index.html"), []byte("<html>cover site</html>"), 0600); err != nil {
+					if err := os.WriteFile(filepath.Join(directory, "site", "index.html"), []byte("<html>cover site</html>"), 0o600); err != nil {
 						t.Fatal(err)
 					}
 					server, ca := masqueradeServer(t, &hytransport.Config{Auth: auth, MasqType: "file", MasqFile: directory}, masked)

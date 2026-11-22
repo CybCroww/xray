@@ -72,6 +72,7 @@ func destinationHeader(header []byte, ip netip.Addr) {
 		copy(header[1:17], raw[:])
 	}
 }
+
 func parseDestination(header []byte) (netip.Addr, bool) {
 	if len(header) < destinationSize {
 		return netip.Addr{}, false
@@ -89,6 +90,7 @@ func parseDestination(header []byte) (netip.Addr, bool) {
 	}
 	return netip.Addr{}, false
 }
+
 func parsePacketSource(oob []byte) (netip.Addr, error) {
 	messages, err := unix.ParseSocketControlMessage(oob)
 	if err != nil {
@@ -110,6 +112,7 @@ func parsePacketSource(oob []byte) (netip.Addr, error) {
 	}
 	return netip.Addr{}, nil
 }
+
 func packetSource(ip netip.Addr) []byte {
 	if ip.Is4() {
 		return (&ipv4.ControlMessage{Src: net.IP(ip.AsSlice())}).Marshal()
@@ -147,6 +150,7 @@ func PreservePacketDestination(udp *net.UDPConn) (net.PacketConn, error) {
 	}
 	return &destinationSocket{PacketConn: udp, udp: udp, ipv4: is4, oob: make([]byte, 256)}, nil
 }
+
 func (s *destinationSocket) ReadFrom(payload []byte) (int, net.Addr, error) {
 	n, oobn, flags, peer, err := s.udp.ReadMsgUDP(payload, s.oob)
 	if err != nil {
@@ -178,6 +182,7 @@ func (s *destinationSocket) ReadFrom(payload []byte) (int, net.Addr, error) {
 	}
 	return n, slot.address, nil
 }
+
 func (s *destinationSocket) WriteTo(payload []byte, address net.Addr) (int, error) {
 	peer, ok := address.(*packetDestination)
 	if !ok {

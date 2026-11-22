@@ -54,8 +54,10 @@ var (
 	TcpResponsePadding  = padding{Min: 128, Max: 1024}
 )
 
-type datagramKey struct{}
-type targetKey struct{}
+type (
+	datagramKey struct{}
+	targetKey   struct{}
+)
 
 func ContextWithNativeTarget(ctx context.Context, target net.Destination) context.Context {
 	return context.WithValue(ctx, targetKey{}, target)

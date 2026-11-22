@@ -258,7 +258,7 @@ func TestCorruptControlJournalRejectsRecoveryWithoutStoppingOwner(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer s.brokerStop()
-	if err := os.WriteFile(filepath.Join(s.broker.control.root, "state.json"), []byte("{"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(s.broker.control.root, "state.json"), []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	recovered := &supervisor{root: root}

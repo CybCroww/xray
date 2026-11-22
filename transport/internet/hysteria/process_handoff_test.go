@@ -117,7 +117,7 @@ func testManagedHysteria(t *testing.T, binary string, nativeA, nativeB, masked, 
 	certPEM, keyPEM := certificate.ToPEM()
 	certFile, keyFile := filepath.Join(root, "cert.pem"), filepath.Join(root, "key.pem")
 	for path, data := range map[string][]byte{certFile: certPEM, keyFile: keyPEM} {
-		if err := os.WriteFile(path, data, 0600); err != nil {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -173,7 +173,7 @@ func testManagedHysteria(t *testing.T, binary string, nativeA, nativeB, masked, 
 		}
 		defer fd.Close()
 		dir := filepath.Join(root, strconv.Itoa(int(slot)))
-		if err := os.Mkdir(dir, 0700); err != nil {
+		if err := os.Mkdir(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
 		control := filepath.Join(dir, "ctl.sock")
@@ -188,10 +188,10 @@ func testManagedHysteria(t *testing.T, binary string, nativeA, nativeB, masked, 
 		config := fmt.Sprintf(`{"inbounds":[{"tag":"hy","listen":%q,"port":%d,"protocol":"hysteria","settings":{"users":[{"auth":"test-auth","email":"tester"}]},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"native":%t},"tlsSettings":{"certificates":[{"certificateFile":%q,"keyFile":%q,"oneTimeLoading":true}]},"finalmask":{"quicParams":{"disableChromeParrot":true,"congestion":"reno"}%s}}}],"outbounds":[{"protocol":"freedom","settings":{"redirect":%q,"finalRules":[{"action":"allow","ip":["127.0.0.1/32"]}]}}]}`,
 			local.IP.String(), local.Port, native, certFile, keyFile, configuredMask, backend.Addr().String())
 		manifestFile, configFile := filepath.Join(dir, "manifest.json"), filepath.Join(dir, "config.json")
-		if err := os.WriteFile(manifestFile, manifest, 0600); err != nil {
+		if err := os.WriteFile(manifestFile, manifest, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(configFile, []byte(config), 0600); err != nil {
+		if err := os.WriteFile(configFile, []byte(config), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		log, err := os.Create(filepath.Join(dir, "process.log"))

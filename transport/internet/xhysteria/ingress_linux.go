@@ -168,8 +168,10 @@ func (i *NativeIngress) addRing(slot byte, directTransmit bool) ([]*os.File, err
 		child.Close()
 		return nil, errors.New("native ring attachment was not acknowledged")
 	}
-	return []*os.File{child, os.NewFile(uintptr(ring.file), "native-packet-ring"),
-		os.NewFile(uintptr(ring.wake), "native-ring-readable"), os.NewFile(uintptr(ring.space), "native-ring-writable")}, nil
+	return []*os.File{
+		child, os.NewFile(uintptr(ring.file), "native-packet-ring"),
+		os.NewFile(uintptr(ring.wake), "native-ring-readable"), os.NewFile(uintptr(ring.space), "native-ring-writable"),
+	}, nil
 }
 
 func (i *NativeIngress) Activate(slot byte) error {

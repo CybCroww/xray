@@ -234,7 +234,7 @@ func (s *supervisor) replaceDirectBroker() error {
 
 func (s *supervisor) launchDirectBroker(ctx context.Context, backup *directBrokerBackup) error {
 	directory := filepath.Join(s.root, fmt.Sprintf("broker-recovery-%d", s.broker.pid))
-	if err := os.Mkdir(directory, 0700); err != nil {
+	if err := os.Mkdir(directory, 0o700); err != nil {
 		return err
 	}
 	path := filepath.Join(directory, "manifest.json")

@@ -64,8 +64,10 @@ func TestEmbeddedNativeOutbound(t *testing.T) {
 					network, address string
 					size             int
 				}{
-					{"tcp", tcpTarget, 1}, {"tcp", tcpTarget, 128 * 1024},
-					{"udp", udpTarget, 1}, {"udp", udpTarget, 4096},
+					{"tcp", tcpTarget, 1},
+					{"tcp", tcpTarget, 128 * 1024},
+					{"udp", udpTarget, 1},
+					{"udp", udpTarget, 4096},
 				} {
 					t.Run(fmt.Sprintf("%s_%d", test.network, test.size), func(t *testing.T) {
 						ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

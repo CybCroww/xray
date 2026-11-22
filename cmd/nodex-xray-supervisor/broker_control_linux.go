@@ -53,8 +53,10 @@ func (c *brokerControl) identity() brokerControlIdentity {
 }
 
 func (c *brokerControl) client(identity brokerControlIdentity) brokerClient {
-	return brokerClient{path: filepath.Join(c.root, fmt.Sprintf("c%d", identity.Sequence), "ctl.sock"),
-		nonce: c.owner.nonce, pid: identity.PID, startTicks: identity.StartTicks}
+	return brokerClient{
+		path:  filepath.Join(c.root, fmt.Sprintf("c%d", identity.Sequence), "ctl.sock"),
+		nonce: c.owner.nonce, pid: identity.PID, startTicks: identity.StartTicks,
+	}
 }
 
 func runBrokerControl(path string) error {
@@ -83,8 +85,10 @@ func runBrokerControl(path string) error {
 		return err
 	}
 	ownerRoot := filepath.Dir(filepath.Dir(directory))
-	owner := brokerClient{path: filepath.Join(ownerRoot, "ctl.sock"), nonce: config.Nonce,
-		pid: config.Owner.PID, startTicks: config.Owner.StartTicks}
+	owner := brokerClient{
+		path: filepath.Join(ownerRoot, "ctl.sock"), nonce: config.Nonce,
+		pid: config.Owner.PID, startTicks: config.Owner.StartTicks,
+	}
 	if err := validateBrokerProcess(ownerRoot, &config.Owner); err != nil {
 		return err
 	}
@@ -151,10 +155,12 @@ func (s *supervisor) attachBrokerControl(ctx context.Context) error {
 	if !response.ControlCapable {
 		return nil
 	}
-	c := &brokerControl{root: filepath.Join(filepath.Dir(s.broker.path), "control"), owner: *s.broker,
-		config: brokerControlManifest{Owner: *s.brokerState, Nonce: s.broker.nonce}}
+	c := &brokerControl{
+		root: filepath.Join(filepath.Dir(s.broker.path), "control"), owner: *s.broker,
+		config: brokerControlManifest{Owner: *s.brokerState, Nonce: s.broker.nonce},
+	}
 	c.owner.control = nil
-	if err := os.Mkdir(c.root, 0700); err != nil && !os.IsExist(err) {
+	if err := os.Mkdir(c.root, 0o700); err != nil && !os.IsExist(err) {
 		return err
 	}
 	if err := handoff.PrivateSocketDirectory(c.root); err != nil {
@@ -251,7 +257,7 @@ func (c *brokerControl) launch(ctx context.Context) error {
 	// All prior controllers are either absent (bootstrap) or proven dead.
 	c.target.Sequence++
 	directory := filepath.Join(c.root, fmt.Sprintf("c%d", c.target.Sequence))
-	if err := os.Mkdir(directory, 0700); err != nil {
+	if err := os.Mkdir(directory, 0o700); err != nil {
 		return err
 	}
 	path := filepath.Join(directory, "manifest.json")
@@ -307,7 +313,7 @@ func (c *brokerControl) launch(ctx context.Context) error {
 }
 
 func (c *brokerControl) claim(ctx context.Context) (*os.File, error) {
-	fd, err := unix.Open(filepath.Join(c.root, ".lock"), unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
+	fd, err := unix.Open(filepath.Join(c.root, ".lock"), unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -379,7 +385,7 @@ func saveControlState(root string, identity brokerControlIdentity) error {
 		return err
 	}
 	path := filepath.Join(root, ".state.new")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}

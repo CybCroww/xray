@@ -156,6 +156,14 @@ func main() {
 		}
 
 		if info.IsDir() {
+			if path != pwd {
+				if info.Name() == ".git" {
+					return filepath.SkipDir
+				}
+				if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 

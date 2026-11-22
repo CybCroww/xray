@@ -18,7 +18,7 @@ import (
 
 func TestUserLimitBothDispatchPathsKeepStatsAndTimeoutReader(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "limits.json")
-	if err := os.WriteFile(file, []byte(`{"version":1,"users":{"458":{"uplinkBytesPerSecond":125000,"downlinkBytesPerSecond":125000}}}`), 0600); err != nil {
+	if err := os.WriteFile(file, []byte(`{"version":1,"users":{"458":{"uplinkBytesPerSecond":125000,"downlinkBytesPerSecond":125000}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	old := userlimit.Default

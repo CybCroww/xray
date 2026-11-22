@@ -68,8 +68,10 @@ func testManagedXHTTPProcesses(t *testing.T, binary string, secure bool) {
 		}
 		realitySettings = fmt.Sprintf(`,"security":"reality","realitySettings":{"target":%q,"serverNames":["localhost"],"privateKey":%q,"shortIds":["1234567890abcdef"]}`,
 			decoy.Listener.Addr().String(), base64.RawURLEncoding.EncodeToString(key.Bytes()))
-		clientReality = &reality.Config{ServerName: "localhost", PublicKey: key.PublicKey().Bytes(), Fingerprint: "chrome", SpiderX: "/",
-			ShortId: []byte{0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef}}
+		clientReality = &reality.Config{
+			ServerName: "localhost", PublicKey: key.PublicKey().Bytes(), Fingerprint: "chrome", SpiderX: "/",
+			ShortId: []byte{0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef},
+		}
 	}
 	sharedPath := filepath.Join(root, "vxt.sock")
 	shared, err := net.ListenUnix("unix", &net.UnixAddr{Name: sharedPath, Net: "unix"})
@@ -117,7 +119,7 @@ func testManagedXHTTPProcesses(t *testing.T, binary string, secure bool) {
 			}
 		}()
 		dir := filepath.Join(root, string(gen))
-		if err := os.Mkdir(dir, 0700); err != nil {
+		if err := os.Mkdir(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
 		ctl := filepath.Join(dir, "ctl.sock")
@@ -129,18 +131,19 @@ func testManagedXHTTPProcesses(t *testing.T, binary string, secure bool) {
 		if gen == 'C' {
 			config = strings.ReplaceAll(config, `"mode":"auto"`, `"mode":"stream-one"`)
 		}
-		manifest, err := json.Marshal(handoff.Manifest{Control: ctl,
-			TCP:  []handoff.TCPBinding{{Tag: "vxr", Port: port, FD: 3}},
-			Unix: []handoff.UnixBinding{{Tag: "vxt", Path: sharedPath, FD: 4}},
+		manifest, err := json.Marshal(handoff.Manifest{
+			Control: ctl,
+			TCP:     []handoff.TCPBinding{{Tag: "vxr", Port: port, FD: 3}},
+			Unix:    []handoff.UnixBinding{{Tag: "vxt", Path: sharedPath, FD: 4}},
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		configPath, manifestPath := filepath.Join(dir, "config.json"), filepath.Join(dir, "manifest.json")
-		if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+		if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(manifestPath, manifest, 0600); err != nil {
+		if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		log, err := os.Create(filepath.Join(dir, "process.log"))

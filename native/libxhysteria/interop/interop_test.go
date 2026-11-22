@@ -74,9 +74,11 @@ func TestNativeClientAgainstXray(t *testing.T) {
 				t.Helper()
 				ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 				defer cancel()
-				args := []string{"--server", address, "--server-name", serverName, "--ca", trustedCA,
+				args := []string{
+					"--server", address, "--server-name", serverName, "--ca", trustedCA,
 					"--auth-env", "XHYS_TEST_AUTH", "--tcp", tcpTarget, "--udp", udpTarget,
-					"--payload-size", size}
+					"--payload-size", size,
+				}
 				if masked {
 					args = append(args, "--salamander-env", "XHYS_TEST_PSK")
 				}
@@ -142,10 +144,10 @@ func TestXrayClientAgainstNative(t *testing.T) {
 			certificate, _ := cert.MustGenerate(nil, cert.CommonName("localhost"), cert.DNSNames("localhost"))
 			dir := t.TempDir()
 			certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
-			if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate}), 0600); err != nil {
+			if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate}), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: certificate.PrivateKey}), 0600); err != nil {
+			if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: certificate.PrivateKey}), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -294,7 +296,7 @@ func xrayServerWithConfig(t testing.TB, masked bool, modify func(*core.Config)) 
 	t.Helper()
 	certificate, _ := cert.MustGenerate(nil, cert.CommonName("localhost"), cert.DNSNames("localhost"))
 	caPath := filepath.Join(t.TempDir(), "ca.pem")
-	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate}), 0600); err != nil {
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate}), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	reservation, err := net.ListenPacket("udp4", "127.0.0.1:0")

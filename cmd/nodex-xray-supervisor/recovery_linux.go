@@ -111,7 +111,8 @@ func adopt(ctx context.Context, root string, saved generationStatus, states ...s
 	if err != nil || hash != saved.SHA256 {
 		return nil, errors.New("generation binary hash changed")
 	}
-	g := &generation{id: saved.ID, dir: dir, hash: hash, configHash: saved.ConfigSHA256,
+	g := &generation{
+		id: saved.ID, dir: dir, hash: hash, configHash: saved.ConfigSHA256,
 		slot: saved.Slot, udp: saved.UDP,
 		pid: saved.PID, startTicks: ticks, control: handoff.ControlSocket(filepath.Join(dir, "ctl.sock")), done: make(chan struct{}),
 		signal: func(sig syscall.Signal) error {
@@ -121,7 +122,8 @@ func adopt(ctx context.Context, root string, saved generationStatus, states ...s
 				return os.ErrProcessDone
 			}
 			return unix.PidfdSendSignal(fd, unix.Signal(sig), nil, 0)
-		}}
+		},
+	}
 	if len(states) == 0 {
 		states = []string{"active"}
 	}
@@ -200,8 +202,10 @@ func recoverSupervisor(ctx context.Context, root, probe string, r release) (*sup
 	if export.PID != saved.Active.PID {
 		return nil, errors.New("listener exporter is not the saved generation process")
 	}
-	s := &supervisor{ctx: ctx, root: root, probe: probe, bindings: bindings,
-		seq: saved.Sequence, boot: boot, phase: "active", lastErr: saved.Error}
+	s := &supervisor{
+		ctx: ctx, root: root, probe: probe, bindings: bindings,
+		seq: saved.Sequence, boot: boot, phase: "active", lastErr: saved.Error,
+	}
 	if err := s.recoverBroker(timeout, saved.Broker); err != nil {
 		return nil, err
 	}

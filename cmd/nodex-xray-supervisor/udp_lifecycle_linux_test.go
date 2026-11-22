@@ -52,7 +52,7 @@ func hysteriaTunnel(t *testing.T, ctx context.Context, binary, root string, port
 	pin := sha256.Sum256(block.Bytes)
 	config := fmt.Sprintf(`{"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":%d,"protocol":"socks","settings":{"auth":"noauth","udp":false}}],"outbounds":[{"protocol":"hysteria","settings":{"address":"127.0.0.1","port":%d},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"auth":"test-auth"},"tlsSettings":{"serverName":"localhost","pinnedPeerCertSha256":"%x"},"finalmask":{"quicParams":{"disableChromeParrot":true,"congestion":"reno"},"udp":[{"type":"salamander","settings":{"password":"test-password"}}]}}}]}`, local, port, pin)
 	path := filepath.Join(directory, "client.json")
-	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	command := exec.CommandContext(ctx, binary, "run", "-config", path)
@@ -166,7 +166,7 @@ func TestHysteriaCandidateProbe(t *testing.T) {
 	}
 	if gate := os.Getenv("NODEX_TEST_HY_SWITCH_GATE"); id == "g2" && gate != "" {
 		if _, err := os.Stat(gate); err == nil {
-			if err := os.WriteFile(gate+".ready", nil, 0600); err != nil {
+			if err := os.WriteFile(gate+".ready", nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
 			deadline := time.NewTimer(15 * time.Second)
@@ -229,7 +229,7 @@ func TestSupervisorHysteriaGenerations(t *testing.T) {
 			defer cancel()
 			root := socketRoot(t)
 			runtime := filepath.Join(root, "run")
-			if err := os.Mkdir(runtime, 0700); err != nil {
+			if err := os.Mkdir(runtime, 0o700); err != nil {
 				t.Fatal(err)
 			}
 			public, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -241,8 +241,8 @@ func TestSupervisorHysteriaGenerations(t *testing.T) {
 			certificate, _ := cert.MustGenerate(nil, cert.CommonName("localhost"), cert.DNSNames("localhost"))
 			certificatePEM, keyPEM := certificate.ToPEM()
 			certificatePath, keyPath := filepath.Join(root, "cert.pem"), filepath.Join(root, "key.pem")
-			os.WriteFile(certificatePath, certificatePEM, 0600)
-			os.WriteFile(keyPath, keyPEM, 0600)
+			os.WriteFile(certificatePath, certificatePEM, 0o600)
+			os.WriteFile(keyPath, keyPEM, 0o600)
 			freeTCP := func() int {
 				listener, err := net.Listen("tcp4", "127.0.0.1:0")
 				if err != nil {
@@ -271,7 +271,7 @@ func TestSupervisorHysteriaGenerations(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(path, wire, 0600); err != nil {
+				if err := os.WriteFile(path, wire, 0o600); err != nil {
 					t.Fatal(err)
 				}
 				return release{binary, path}
@@ -279,22 +279,22 @@ func TestSupervisorHysteriaGenerations(t *testing.T) {
 			a, b, c := makeRelease('A'), makeRelease('B'), makeRelease('C')
 			metadata, _ := json.Marshal(map[string]any{"Binary": binary, "Root": root, "Port": port})
 			metaPath := filepath.Join(root, "probe.json")
-			os.WriteFile(metaPath, metadata, 0600)
+			os.WriteFile(metaPath, metadata, 0o600)
 			t.Setenv("NODEX_TEST_HY_PROBE", metaPath)
 			executable, _ := os.Executable()
 			t.Setenv("NODEX_TEST_EXEC", executable)
 			switchGate := filepath.Join(root, "switch-gate")
 			switchCrash := os.Getenv("NODEX_TEST_CRASH_DURING_SWITCH") == "1"
 			if switchCrash {
-				if err := os.WriteFile(switchGate, nil, 0600); err != nil {
+				if err := os.WriteFile(switchGate, nil, 0o600); err != nil {
 					t.Fatal(err)
 				}
 				t.Setenv("NODEX_TEST_HY_SWITCH_GATE", switchGate)
 			}
 			probe := filepath.Join(root, "probe")
-			os.WriteFile(probe, []byte("#!/bin/sh\nNODEX_TEST_PROBE_ID=\"$1\" exec \"$NODEX_TEST_EXEC\" -test.run '^TestHysteriaCandidateProbe$'\n"), 0700)
+			os.WriteFile(probe, []byte("#!/bin/sh\nNODEX_TEST_PROBE_ID=\"$1\" exec \"$NODEX_TEST_EXEC\" -test.run '^TestHysteriaCandidateProbe$'\n"), 0o700)
 			if publicProbe := os.Getenv("NODEX_TEST_PUBLIC_PROBE"); publicProbe != "" {
-				os.WriteFile(probe, []byte("#!/bin/sh\nset -e\n\"$NODEX_TEST_PUBLIC_PROBE\" \"$1\"\nNODEX_TEST_PROBE_ID=\"$1\" exec \"$NODEX_TEST_EXEC\" -test.run '^TestHysteriaCandidateProbe$'\n"), 0700)
+				os.WriteFile(probe, []byte("#!/bin/sh\nset -e\n\"$NODEX_TEST_PUBLIC_PROBE\" \"$1\"\nNODEX_TEST_PROBE_ID=\"$1\" exec \"$NODEX_TEST_EXEC\" -test.run '^TestHysteriaCandidateProbe$'\n"), 0o700)
 			}
 			var processes []*exec.Cmd
 			spawn := func(action, config string) *exec.Cmd {
@@ -498,7 +498,7 @@ func TestSupervisorHysteriaGenerations(t *testing.T) {
 			}
 			rollbackRecovery := switchCrash && os.Getenv("NODEX_TEST_RECOVERY_PROBE_FAILURE") == "1"
 			if rollbackRecovery {
-				if err := os.WriteFile(switchGate+".fail", nil, 0600); err != nil {
+				if err := os.WriteFile(switchGate+".fail", nil, 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}

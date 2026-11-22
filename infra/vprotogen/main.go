@@ -119,8 +119,19 @@ func main() {
 	var protoFiles []string
 	var existingPbFiles []string
 	err := filepath.WalkDir(pwd, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
 			return err
+		}
+		if d.IsDir() {
+			if path != pwd {
+				if d.Name() == ".git" {
+					return filepath.SkipDir
+				}
+				if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+					return filepath.SkipDir
+				}
+			}
+			return nil
 		}
 		if strings.HasSuffix(d.Name(), ".proto") {
 			rel, _ := filepath.Rel(pwd, path)

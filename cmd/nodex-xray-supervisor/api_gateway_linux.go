@@ -75,7 +75,7 @@ func (g *apiGateway) persist() error {
 		return err
 	}
 	path := filepath.Join(g.root, ".management.new")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -256,6 +256,7 @@ func (g *apiGateway) GetInboundUsers(ctx context.Context, request *handler.GetIn
 	}
 	return handler.NewHandlerServiceClient(client).GetInboundUsers(ctx, request)
 }
+
 func (g *apiGateway) GetInboundUsersCount(ctx context.Context, request *handler.GetInboundUserRequest) (*handler.GetInboundUsersCountResponse, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -265,6 +266,7 @@ func (g *apiGateway) GetInboundUsersCount(ctx context.Context, request *handler.
 	}
 	return handler.NewHandlerServiceClient(client).GetInboundUsersCount(ctx, request)
 }
+
 func (g *apiGateway) ListInbounds(ctx context.Context, request *handler.ListInboundsRequest) (*handler.ListInboundsResponse, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -274,6 +276,7 @@ func (g *apiGateway) ListInbounds(ctx context.Context, request *handler.ListInbo
 	}
 	return handler.NewHandlerServiceClient(client).ListInbounds(ctx, request)
 }
+
 func (g *apiGateway) RestartLogger(ctx context.Context, request *logger.RestartLoggerRequest) (*logger.RestartLoggerResponse, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

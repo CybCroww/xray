@@ -49,7 +49,7 @@ func TestRejectUnsupportedConfigAndExistingSocket(t *testing.T) {
 		t.Fatal("reused claimed runtime")
 	}
 	path := filepath.Join(root, "used.sock")
-	b := binding{address: path, mode: 0660}
+	b := binding{address: path, mode: 0o660}
 	l, err := listen(b)
 	if err != nil {
 		t.Fatal(err)
@@ -58,14 +58,14 @@ func TestRejectUnsupportedConfigAndExistingSocket(t *testing.T) {
 	if _, err := listen(b); err == nil {
 		t.Fatal("replaced existing Unix socket")
 	}
-	if info, err := os.Lstat(path); err != nil || info.Mode().Perm() != 0660 {
+	if info, err := os.Lstat(path); err != nil || info.Mode().Perm() != 0o660 {
 		t.Fatalf("socket changed: %v, %v", info, err)
 	}
 }
 
 func TestStateWriteFailureBlocksDrain(t *testing.T) {
 	root := socketRoot(t)
-	if err := os.Mkdir(filepath.Join(root, "state.json"), 0700); err != nil {
+	if err := os.Mkdir(filepath.Join(root, "state.json"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	s := &supervisor{root: root, ctx: t.Context()}
@@ -230,7 +230,7 @@ func TestCandidateProbe(t *testing.T) {
 		down.Body.Close()
 	}
 	if id == "g2" && os.Getenv("NODEX_TEST_GATE") != "" {
-		if err := os.WriteFile(os.Getenv("NODEX_TEST_GATE")+".ready", nil, 0600); err != nil {
+		if err := os.WriteFile(os.Getenv("NODEX_TEST_GATE")+".ready", nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		for ctx.Err() == nil {
@@ -281,14 +281,14 @@ func TestRecoverAfterSupervisorCrash(t *testing.T) {
 	}
 	t.Setenv("NODEX_TEST_EXEC", executable)
 	probe := filepath.Join(root, "probe")
-	if err := os.WriteFile(probe, []byte("#!/bin/sh\nNODEX_TEST_PROBE_ID=\"$1\" exec \"$NODEX_TEST_EXEC\" -test.run '^TestCandidateProbe$'\n"), 0700); err != nil {
+	if err := os.WriteFile(probe, []byte("#!/bin/sh\nNODEX_TEST_PROBE_ID=\"$1\" exec \"$NODEX_TEST_EXEC\" -test.run '^TestCandidateProbe$'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	makeConfig := func(marker byte) string {
 		out := backend(t, marker)
 		config := fmt.Sprintf(`{"inbounds":[{"tag":"grpc","listen":"127.0.0.1","port":%d,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","port":%d,"network":"tcp"},"streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"canary"}}}],"outbounds":[{"protocol":"freedom"}]}`, port, out)
 		path := filepath.Join(root, "config-"+string(marker)+".json")
-		if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		return path
@@ -311,10 +311,12 @@ func TestRecoverAfterSupervisorCrash(t *testing.T) {
 		})
 		return cmd
 	}
-	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{DisableKeepAlives: true,
+	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{
+		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", filepath.Join(runtime, "supervisor.sock"))
-		}}}
+		},
+	}}
 	wait := func(phase, id string) status {
 		t.Helper()
 		deadline := time.Now().Add(12 * time.Second)
@@ -374,7 +376,7 @@ func TestRecoverAfterSupervisorCrash(t *testing.T) {
 		t.Fatal("recovered without the generation's config snapshot")
 	}
 	grpcPulse(t, stream, 'A', 'm')
-	if err := os.WriteFile(snapshotPath, []byte("{}"), 0600); err != nil {
+	if err := os.WriteFile(snapshotPath, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	tampered := spawn("recover", a)
@@ -382,7 +384,7 @@ func TestRecoverAfterSupervisorCrash(t *testing.T) {
 		t.Fatal("recovered with a changed generation config snapshot")
 	}
 	grpcPulse(t, stream, 'A', 't')
-	if err := os.WriteFile(snapshotPath, snapshot, 0600); err != nil {
+	if err := os.WriteFile(snapshotPath, snapshot, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(snapshotPath + ".retained"); err != nil {
@@ -452,7 +454,7 @@ func TestSupervisorRealGenerations(t *testing.T) {
 	}
 	t.Setenv("NODEX_TEST_EXEC", executable)
 	probe := filepath.Join(root, "probe")
-	if err := os.WriteFile(probe, []byte("#!/bin/sh\nNODEX_TEST_PROBE_ID=\"$1\" exec \"$NODEX_TEST_EXEC\" -test.run '^TestCandidateProbe$'\n"), 0700); err != nil {
+	if err := os.WriteFile(probe, []byte("#!/bin/sh\nNODEX_TEST_PROBE_ID=\"$1\" exec \"$NODEX_TEST_EXEC\" -test.run '^TestCandidateProbe$'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	makeRelease := func(marker byte) release {
@@ -461,14 +463,14 @@ func TestSupervisorRealGenerations(t *testing.T) {
 		{"tag":"grpc","listen":"127.0.0.1","port":%d,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","port":%d,"network":"tcp"},"streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"canary"}}},
 		{"tag":"origin","listen":%q,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","port":%d,"network":"tcp"},"streamSettings":{"network":"xhttp","xhttpSettings":{"path":"/x/","mode":"packet-up"}}}],"outbounds":[{"protocol":"freedom"}]}`, port, out, unix+",0660", out)
 		path := filepath.Join(root, "config-"+string(marker)+".json")
-		if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		return release{binary, path}
 	}
 	a, b, c := makeRelease('A'), makeRelease('B'), makeRelease('C')
 	runtime := filepath.Join(root, "run")
-	if err := os.Mkdir(runtime, 0700); err != nil {
+	if err := os.Mkdir(runtime, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	s, err := newSupervisor(ctx, runtime, probe, a)
@@ -527,7 +529,7 @@ func TestSupervisorRealGenerations(t *testing.T) {
 	defer endB()
 	bStream := grpcStream(t, bCtx, address)
 	grpcPulse(t, bStream, 'B', '4')
-	if err := os.WriteFile(gate, nil, 0600); err != nil {
+	if err := os.WriteFile(gate, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	failure := wait("draining", "g1")

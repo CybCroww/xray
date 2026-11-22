@@ -22,8 +22,10 @@ func TestNativeHalfClosePreservesRequestAndCompleteResponse(t *testing.T) {
 		name, bridge string
 		sendBudget   uint32
 	}{
-		{"shared", "shared", 0}, {"socket", "socket", 0},
-		{"shared_small_budget", "shared", maxFrame}, {"socket_small_budget", "socket", maxFrame},
+		{"shared", "shared", 0},
+		{"socket", "socket", 0},
+		{"shared_small_budget", "shared", maxFrame},
+		{"socket_small_budget", "socket", maxFrame},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
 			t.Setenv("XRAY_HYSTERIA_BRIDGE", mode.bridge)

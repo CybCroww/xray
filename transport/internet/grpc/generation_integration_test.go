@@ -104,7 +104,7 @@ func testManagedXrayProcesses(t *testing.T, binary string, secure bool) {
 			}
 		}()
 		directory := filepath.Join(root, generation)
-		if err := os.Mkdir(directory, 0700); err != nil {
+		if err := os.Mkdir(directory, 0o700); err != nil {
 			t.Fatal(err)
 		}
 		socket := filepath.Join(directory, "ctl.sock")
@@ -119,10 +119,10 @@ func testManagedXrayProcesses(t *testing.T, binary string, secure bool) {
 			t.Fatal(err)
 		}
 		configFile, manifestFile := filepath.Join(directory, "config.json"), filepath.Join(directory, "manifest.json")
-		if err := os.WriteFile(configFile, []byte(config), 0600); err != nil {
+		if err := os.WriteFile(configFile, []byte(config), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(manifestFile, manifest, 0600); err != nil {
+		if err := os.WriteFile(manifestFile, manifest, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		log, err := os.Create(filepath.Join(directory, "process.log"))

@@ -138,10 +138,12 @@ func (s *supervisor) snapshot(phase string) status {
 		identity := s.broker.control.identity()
 		control = &identity
 	}
-	return status{Phase: phase, Sequence: s.seq, BootID: s.boot, Active: s.active.status(), Other: s.other.status(), Broker: s.brokerState,
+	return status{
+		Phase: phase, Sequence: s.seq, BootID: s.boot, Active: s.active.status(), Other: s.other.status(), Broker: s.brokerState,
 		BrokerControl:       control,
 		BrokerRecoveryReady: phase == "active" && s.brokerBackup != nil,
-		Uncertain:           phase == "switching" || phase == "admission-unknown", Error: s.lastErr}
+		Uncertain:           phase == "switching" || phase == "admission-unknown", Error: s.lastErr,
+	}
 }
 
 func (s *supervisor) record(phase string, active, other *generation, err error) error {
@@ -176,7 +178,7 @@ func saveState(root string, snapshot status) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(filepath.Join(root, ".state.new"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(filepath.Join(root, ".state.new"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -305,7 +307,7 @@ func (s *supervisor) start(ctx context.Context, r release, config []byte) (*gene
 	}
 	slot := byte(sequence - 1)
 	dir := filepath.Join(s.root, id)
-	if err := os.Mkdir(dir, 0700); err != nil {
+	if err := os.Mkdir(dir, 0o700); err != nil {
 		return nil, err
 	}
 	started := false
@@ -396,7 +398,7 @@ func (s *supervisor) start(ctx context.Context, r release, config []byte) (*gene
 		return nil, err
 	}
 	manifestPath := filepath.Join(dir, "manifest.json")
-	if err := os.WriteFile(manifestPath, data, 0600); err != nil {
+	if err := os.WriteFile(manifestPath, data, 0o600); err != nil {
 		return nil, err
 	}
 	if err := writePrivateSnapshot(filepath.Join(dir, "config.json"), config); err != nil {
@@ -413,10 +415,12 @@ func (s *supervisor) start(ctx context.Context, r release, config []byte) (*gene
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	g := &generation{id: id, dir: dir, hash: hash, configHash: configDigest(config),
+	g := &generation{
+		id: id, dir: dir, hash: hash, configHash: configDigest(config),
 		slot: slot, udp: len(manifest.UDP) != 0,
 		pid: cmd.Process.Pid, signal: func(sig syscall.Signal) error { return cmd.Process.Signal(sig) },
-		control: handoff.ControlSocket(manifest.Control), done: make(chan struct{})}
+		control: handoff.ControlSocket(manifest.Control), done: make(chan struct{}),
+	}
 	go func() {
 		g.waitErr = cmd.Wait()
 		close(g.done)
@@ -471,7 +475,7 @@ func (s *supervisor) start(ctx context.Context, r release, config []byte) (*gene
 func configDigest(config []byte) string { return fmt.Sprintf("%x", sha256.Sum256(config)) }
 
 func writePrivateSnapshot(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -498,7 +502,7 @@ func snapshotBinary(source, destination string) (string, error) {
 	if err != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > 256<<20 {
 		return "", errors.New("candidate binary must be a nonempty regular file of at most 256 MiB")
 	}
-	dest, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0500)
+	dest, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o500)
 	if err != nil {
 		return "", err
 	}

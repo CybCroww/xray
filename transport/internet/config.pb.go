@@ -7,14 +7,13 @@
 package internet
 
 import (
-	reflect "reflect"
-	sync "sync"
-	unsafe "unsafe"
-
 	net "github.com/xtls/xray-core/common/net"
 	serial "github.com/xtls/xray-core/common/serial"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
 )
 
 const (
@@ -1046,24 +1045,21 @@ func file_transport_internet_config_proto_rawDescGZIP() []byte {
 	return file_transport_internet_config_proto_rawDescData
 }
 
-var (
-	file_transport_internet_config_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-	file_transport_internet_config_proto_msgTypes  = make([]protoimpl.MessageInfo, 6)
-	file_transport_internet_config_proto_goTypes   = []any{
-		DomainStrategy(0),           // 0: xray.transport.internet.DomainStrategy
-		AddressPortStrategy(0),      // 1: xray.transport.internet.AddressPortStrategy
-		SocketConfig_TProxyMode(0),  // 2: xray.transport.internet.SocketConfig.TProxyMode
-		(*TransportConfig)(nil),     // 3: xray.transport.internet.TransportConfig
-		(*StreamConfig)(nil),        // 4: xray.transport.internet.StreamConfig
-		(*QuicParams)(nil),          // 5: xray.transport.internet.QuicParams
-		(*CustomSockopt)(nil),       // 6: xray.transport.internet.CustomSockopt
-		(*SocketConfig)(nil),        // 7: xray.transport.internet.SocketConfig
-		(*HappyEyeballsConfig)(nil), // 8: xray.transport.internet.HappyEyeballsConfig
-		(*serial.TypedMessage)(nil), // 9: xray.common.serial.TypedMessage
-		(*net.IPOrDomain)(nil),      // 10: xray.common.net.IPOrDomain
-	}
-)
-
+var file_transport_internet_config_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_transport_internet_config_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_transport_internet_config_proto_goTypes = []any{
+	(DomainStrategy)(0),          // 0: xray.transport.internet.DomainStrategy
+	(AddressPortStrategy)(0),     // 1: xray.transport.internet.AddressPortStrategy
+	(SocketConfig_TProxyMode)(0), // 2: xray.transport.internet.SocketConfig.TProxyMode
+	(*TransportConfig)(nil),      // 3: xray.transport.internet.TransportConfig
+	(*StreamConfig)(nil),         // 4: xray.transport.internet.StreamConfig
+	(*QuicParams)(nil),           // 5: xray.transport.internet.QuicParams
+	(*CustomSockopt)(nil),        // 6: xray.transport.internet.CustomSockopt
+	(*SocketConfig)(nil),         // 7: xray.transport.internet.SocketConfig
+	(*HappyEyeballsConfig)(nil),  // 8: xray.transport.internet.HappyEyeballsConfig
+	(*serial.TypedMessage)(nil),  // 9: xray.common.serial.TypedMessage
+	(*net.IPOrDomain)(nil),       // 10: xray.common.net.IPOrDomain
+}
 var file_transport_internet_config_proto_depIdxs = []int32{
 	9,  // 0: xray.transport.internet.TransportConfig.settings:type_name -> xray.common.serial.TypedMessage
 	10, // 1: xray.transport.internet.StreamConfig.address:type_name -> xray.common.net.IPOrDomain

@@ -19,9 +19,11 @@ import (
 	native "github.com/xtls/xray-core/transport/internet/xhysteria"
 )
 
-const nativePoolIdle = 30 * time.Second
-const nativeSessionFlows = 64
-const nativeGlobalSessions = 16
+const (
+	nativePoolIdle       = 30 * time.Second
+	nativeSessionFlows   = 64
+	nativeGlobalSessions = 16
+)
 
 var nativeSessionSlots atomic.Int32
 

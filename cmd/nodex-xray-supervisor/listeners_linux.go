@@ -114,7 +114,7 @@ func configBindings(config []byte) ([]binding, error) {
 		}
 		if strings.HasPrefix(in.Listen, "/") {
 			path, perm, explicit := strings.Cut(in.Listen, ",")
-			b.address, b.port, b.mode = path, 0, 0600
+			b.address, b.port, b.mode = path, 0, 0o600
 			if filepath.Clean(path) != path || b.transport != "xhttp" || in.Port != 0 {
 				return nil, fmt.Errorf("invalid Unix origin for inbound %q", in.Tag)
 			}

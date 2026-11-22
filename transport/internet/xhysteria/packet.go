@@ -18,11 +18,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const packetHeader = 24
-const maxPacket = 65535
-const packetSocketBuffer = 64 << 10
-const packetPeerCacheSize = 32
-const packetMaxBatch = 8
+const (
+	packetHeader        = 24
+	maxPacket           = 65535
+	packetSocketBuffer  = 64 << 10
+	packetPeerCacheSize = 32
+	packetMaxBatch      = 8
+)
 
 type packetPeerEntry struct {
 	key     [20]byte

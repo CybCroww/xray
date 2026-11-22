@@ -51,7 +51,7 @@ func packetMasks(t testing.TB, kind string) []*serial.TypedMessage {
 		return []*serial.TypedMessage{serial.ToTypedMessage(&noise.Config{Items: []*noise.Item{{Packet: []byte("cover packet")}}}), mask}
 	case "lua":
 		path := filepath.Join(t.TempDir(), "noise.lua")
-		if err := os.WriteFile(path, []byte(`function HandleNoise(plan, address) plan:Add("scripted cover packet") end`), 0600); err != nil {
+		if err := os.WriteFile(path, []byte(`function HandleNoise(plan, address) plan:Add("scripted cover packet") end`), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		return []*serial.TypedMessage{serial.ToTypedMessage(&noise.Config{Script: path}), mask}

@@ -105,7 +105,7 @@ func TestNativeCapacityServerProcess(t *testing.T) {
 			var stats runtime.MemStats
 			runtime.ReadMemStats(&stats)
 			fmt.Fprintf(os.Stderr, "phase=%s go_heap_mib=%.1f go_heap_inuse_mib=%.1f go_retained_mib=%.1f go_stack_mib=%.1f goroutines=%d go_gc_cycles=%d\n", commands.Text(), float64(stats.HeapAlloc)/(1<<20), float64(stats.HeapInuse)/(1<<20), float64(stats.Sys-stats.HeapReleased)/(1<<20), float64(stats.StackInuse)/(1<<20), runtime.NumGoroutine(), stats.NumGC)
-			if err := os.MkdirAll(directory, 0700); err != nil {
+			if err := os.MkdirAll(directory, 0o700); err != nil {
 				t.Fatal(err)
 			}
 			profile, err := os.Create(filepath.Join(directory, commands.Text()+".pprof"))
@@ -340,9 +340,11 @@ func TestNativeServer500Users(t *testing.T) {
 		t.Fatal(err)
 	}
 	tlsConfig := &cryptotls.Config{RootCAs: roots, ServerName: "localhost", NextProtos: []string{"h3"}}
-	quicConfig := &quic.Config{EnableDatagrams: true, DisablePathManager: true, MaxIdleTimeout: time.Minute, KeepAlivePeriod: 10 * time.Second,
+	quicConfig := &quic.Config{
+		EnableDatagrams: true, DisablePathManager: true, MaxIdleTimeout: time.Minute, KeepAlivePeriod: 10 * time.Second,
 		InitialStreamReceiveWindow: 65536, MaxStreamReceiveWindow: 65536,
-		InitialConnectionReceiveWindow: 131072, MaxConnectionReceiveWindow: 131072}
+		InitialConnectionReceiveWindow: 131072, MaxConnectionReceiveWindow: 131072,
+	}
 	connections := make([]*quic.Conn, sessions)
 	streams := make([]*quic.Stream, sessions)
 	t.Cleanup(func() {

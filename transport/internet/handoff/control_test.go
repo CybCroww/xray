@@ -53,7 +53,7 @@ func TestPrivateControlSocket(t *testing.T) {
 		t.Skip("test uses Linux filesystem permissions for Unix sockets")
 	}
 	parent := filepath.Join(t.TempDir(), "g")
-	if err := os.Mkdir(parent, 0755); err != nil {
+	if err := os.Mkdir(parent, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	addr := filepath.Join(parent, "ctl.sock")
@@ -62,7 +62,7 @@ func TestPrivateControlSocket(t *testing.T) {
 		listener.Close()
 		t.Fatal("non-private control directory accepted")
 	}
-	if err := os.Chmod(parent, 0700); err != nil {
+	if err := os.Chmod(parent, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	listener, err := ListenControl(addr, generation)
@@ -70,7 +70,7 @@ func TestPrivateControlSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	if info, err := os.Stat(addr); err != nil || info.Mode().Perm() != 0600 {
+	if info, err := os.Stat(addr); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("unexpected control socket permissions: %v (%v)", info, err)
 	}
 	if other, err := ListenControl(addr, generation); err == nil {

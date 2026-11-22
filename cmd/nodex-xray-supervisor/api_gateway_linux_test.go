@@ -45,6 +45,7 @@ func (s *generationAPIStub) GetInboundUsers(_ context.Context, request *handler.
 	}
 	return response, nil
 }
+
 func (s *generationAPIStub) AlterInbound(_ context.Context, request *handler.AlterInboundRequest) (*handler.AlterInboundResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -63,6 +64,7 @@ func (s *generationAPIStub) AlterInbound(_ context.Context, request *handler.Alt
 	}
 	return &handler.AlterInboundResponse{}, nil
 }
+
 func (s *generationAPIStub) QueryStats(_ context.Context, request *stats.QueryStatsRequest) (*stats.QueryStatsResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

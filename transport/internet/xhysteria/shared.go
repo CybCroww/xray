@@ -38,8 +38,10 @@ const (
 	sharedBytes        = sharedRingBytes + 2*sharedPayloadSlots*sharedPayloadSize
 )
 
-var eventfdSignal = [8]byte{1}
-var creditCounts = [9]byte{0, 1, 2, 3, 4, 5, 6, 7, 8}
+var (
+	eventfdSignal = [8]byte{1}
+	creditCounts  = [9]byte{0, 1, 2, 3, 4, 5, 6, 7, 8}
+)
 
 type frameBridge interface {
 	read() (frame, error)

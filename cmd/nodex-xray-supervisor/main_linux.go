@@ -62,7 +62,7 @@ func run(args []string) error {
 }
 
 func claimRuntime(root string) (*os.File, error) {
-	if err := os.Mkdir(root, 0700); err != nil && !os.IsExist(err) {
+	if err := os.Mkdir(root, 0o700); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
 	if err := handoff.PrivateSocketDirectory(root); err != nil {
@@ -72,7 +72,7 @@ func claimRuntime(root string) (*os.File, error) {
 	if err != nil || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
 		return nil, errors.New("runtime directory must be owned by the supervisor user")
 	}
-	lock, err := os.OpenFile(filepath.Join(root, ".lock"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	lock, err := os.OpenFile(filepath.Join(root, ".lock"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, errors.New("runtime already claimed; recovery must not rebind live listeners")
 	}
@@ -97,7 +97,7 @@ func serve(root, probe string, r release, recovering bool) error {
 		return errors.New("a trusted absolute probe executable is required")
 	}
 	info, err := os.Stat(probe)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return errors.New("probe is not an executable regular file")
 	}
 	claim := claimRuntime
@@ -131,7 +131,7 @@ func serve(root, probe string, r release, recovering bool) error {
 		return err
 	}
 	defer socket.Close()
-	if err := os.Chmod(socket.Addr().String(), 0600); err != nil {
+	if err := os.Chmod(socket.Addr().String(), 0o600); err != nil {
 		return err
 	}
 	start := newSupervisor

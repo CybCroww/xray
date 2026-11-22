@@ -315,8 +315,10 @@ func (g *Generation) UDPStatus() (string, map[string]UDPConnectionStatus) {
 	return g.state, result
 }
 
-type generationContextKey struct{}
-type listenerContextKey struct{}
+type (
+	generationContextKey struct{}
+	listenerContextKey   struct{}
+)
 
 func WithGeneration(ctx context.Context, generation *Generation) context.Context {
 	return context.WithValue(ctx, generationContextKey{}, generation)

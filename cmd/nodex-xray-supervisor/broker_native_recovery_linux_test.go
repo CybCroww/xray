@@ -77,15 +77,15 @@ func testBrokerApplicationUDP(t *testing.T, native, controlOverlap bool) {
 	certificate, _ := cert.MustGenerate(nil, cert.CommonName("localhost"), cert.DNSNames("localhost"))
 	certificatePEM, keyPEM := certificate.ToPEM()
 	certPath, keyPath := filepath.Join(root, "cert.pem"), filepath.Join(root, "key.pem")
-	if err := os.WriteFile(certPath, certificatePEM, 0600); err != nil {
+	if err := os.WriteFile(certPath, certificatePEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	config := fmt.Sprintf(`{"log":{"loglevel":"warning"},"inbounds":[{"tag":"hy","listen":"127.0.0.1","port":%d,"protocol":"hysteria","settings":{"users":[{"auth":"test-auth"}]},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"native":%t},"tlsSettings":{"certificates":[{"certificateFile":%q,"keyFile":%q,"oneTimeLoading":true}]},"finalmask":{"quicParams":{"disableChromeParrot":true},"udp":[{"type":"salamander","settings":{"password":"test-password"}}]}}}],"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.1/32"]}]}}]}`, port, native, certPath, keyPath)
 	configPath := filepath.Join(root, "config.json")
-	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s, err := newSupervisor(ctx, root, "/bin/true", release{binary, configPath})
@@ -192,7 +192,7 @@ func testBrokerApplicationUDP(t *testing.T, native, controlOverlap bool) {
 		}
 	}
 	clientPath := filepath.Join(root, "client.json")
-	if err := os.WriteFile(clientPath, []byte(clientConfig), 0600); err != nil {
+	if err := os.WriteFile(clientPath, []byte(clientConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	log, err := os.Create(filepath.Join(root, "client.log"))
@@ -257,7 +257,7 @@ func testBrokerApplicationUDP(t *testing.T, native, controlOverlap bool) {
 	var second net.Conn
 	if controlOverlap {
 		candidate := filepath.Join(root, "candidate.json")
-		if err := os.WriteFile(candidate, []byte(config), 0600); err != nil {
+		if err := os.WriteFile(candidate, []byte(config), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.upgrade(release{binary, candidate}); err != nil {
@@ -292,7 +292,7 @@ func testBrokerApplicationUDP(t *testing.T, native, controlOverlap bool) {
 		}
 		wire, _ := json.Marshal(parsed)
 		secondPath := filepath.Join(root, "client-b.json")
-		if err := os.WriteFile(secondPath, wire, 0600); err != nil {
+		if err := os.WriteFile(secondPath, wire, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		other := exec.CommandContext(ctx, binary, "run", "-config", secondPath)
