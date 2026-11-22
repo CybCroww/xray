@@ -338,9 +338,7 @@ func xrayServerWithConfig(t testing.TB, masked bool, modify func(*core.Config)) 
 				Account: serial.ToTypedMessage(&account.Account{Auth: auth}),
 			}}}),
 		}},
-		Outbound: []*core.OutboundHandlerConfig{{ProxySettings: serial.ToTypedMessage(&freedom.Config{
-			FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
-		})}},
+		Outbound: []*core.OutboundHandlerConfig{{ProxySettings: serial.ToTypedMessage(&freedom.Config{Firewall: []*freedom.FirewallConfig{{Action: freedom.RuleAction_Allow}}})}},
 	}
 	if modify != nil {
 		modify(config)

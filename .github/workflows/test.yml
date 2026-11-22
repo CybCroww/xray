@@ -84,6 +84,47 @@ jobs:
           CGO_ENABLED: 1
         run: go test -race -timeout 20m ./app/dns/... ./app/proxyman/... ./transport/internet/tagged/... ./transport/internet/splithttp/... ./transport/internet/hysteria/... ./proxy/hysteria/...
 
+  native-hysteria:
+    if: github.ref_name == 'nodes-rust' || github.base_ref == 'nodes-rust'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      CGO_ENABLED: 1
+      RUSTUP_TOOLCHAIN: '1.100.0'
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Set up Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Build native engine and fixtures
+        run: |
+          cargo build --locked --release --features engine --bins --manifest-path native/libxhysteria/Cargo.toml
+          bash native/libxhysteria/build-linux.sh
+      - name: Test Rust engine
+        run: cargo test --locked --release --features engine --lib --manifest-path native/libxhysteria/Cargo.toml
+      - name: Test native integration and accounting
+        env:
+          XHYS_PROBE: ${{ github.workspace }}/native/libxhysteria/target/release/xhys-probe
+          XHYS_ECHO: ${{ github.workspace }}/native/libxhysteria/target/release/xhys-echo
+        run: |
+          bash native/libxhysteria/link-go.sh native/libxhysteria/target/release objcopy \
+            go test -race -tags 'xhysteria_native xhysteria_interop' ./native/libxhysteria/interop \
+            -run '^(TestNativeServerUserLimitAndAccounting|TestEmbeddedNativeServer|TestEmbeddedNativeOutbound|TestGoOutboundAgainstEmbeddedServer|TestNativeServerDynamicUsers|TestNativeShortFlowsReturnQUICStreamCapacity|TestNativeSingleQUICSessionRecyclesClosedStreams)$' \
+            -count=1 -timeout 5m
+      - name: Upload native Linux binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: xray-native-linux-amd64
+          path: build_assets/xray-native
+          if-no-files-found: error
+          retention-days: 7
+
   mobile-build:
     if: github.base_ref == 'app' || (github.base_ref == '' && github.ref_name == 'app')
     permissions:
