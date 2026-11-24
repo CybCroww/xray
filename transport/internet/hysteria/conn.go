@@ -29,6 +29,7 @@ type interConn struct {
 	mu        sync.Mutex
 	closeOnce sync.Once
 	aliveTCP  *atomic.Int64
+	onClose   func()
 }
 
 func (c *interConn) unlock() {
@@ -77,9 +78,14 @@ func (c *interConn) Write(b []byte) (int, error) {
 }
 
 func (c *interConn) Close() error {
-	if c.aliveTCP != nil {
+	if c.aliveTCP != nil || c.onClose != nil {
 		c.closeOnce.Do(func() {
-			c.aliveTCP.Add(-1)
+			if c.aliveTCP != nil {
+				c.aliveTCP.Add(-1)
+			}
+			if c.onClose != nil {
+				c.onClose()
+			}
 		})
 	}
 
@@ -202,6 +208,7 @@ type udpSessionManager struct {
 	next   uint32
 	closed bool
 	budget *datagramReceiveBudget
+	idle   *mobileQUICIdle
 
 	addConn        internet.ConnHandler
 	udpIdleTimeout time.Duration
@@ -216,6 +223,9 @@ func (m *udpSessionManager) close(udpConn *InterConn) {
 			for packet := range udpConn.ch {
 				udpConn.budget.release(packet)
 			}
+		}
+		if m.idle != nil {
+			m.idle.release()
 		}
 	}
 }
@@ -299,6 +309,9 @@ func (m *udpSessionManager) newUDPConn(id uint32) *InterConn {
 	size := udpMessageChanSize
 	if m.budget != nil {
 		size = mobileDatagramsPerFlow
+	}
+	if m.idle != nil {
+		m.idle.acquire()
 	}
 	udpConn := &InterConn{
 		local: m.conn.LocalAddr(), remote: m.conn.RemoteAddr(), user: m.user,

@@ -40,12 +40,14 @@ type client struct {
 	finalMask    *finalmask.FinalMask
 	quicParams   *internet.QuicParams
 
-	conn      *quic.Conn
-	tr        *quic.Transport
-	pktConn   net.PacketConn
-	udpSM     *udpSessionManager
-	aliveTCP  *atomic.Int64
-	lastAlive time.Time
+	conn        *quic.Conn
+	tr          *quic.Transport
+	pktConn     net.PacketConn
+	udpSM       *udpSessionManager
+	aliveTCP    *atomic.Int64
+	lastAlive   time.Time
+	mobileIdle  *mobileQUICIdle
+	stopOnClose func() bool
 }
 
 func (c *client) status() status {
@@ -61,6 +63,12 @@ func (c *client) status() status {
 }
 
 func (c *client) close(force bool) {
+	if c.mobileIdle != nil {
+		c.stopOnClose()
+		c.stopOnClose = nil
+		c.mobileIdle.stop()
+		c.mobileIdle = nil
+	}
 	if c.udpSM != nil {
 		c.udpSM.closeAll()
 	}
@@ -267,8 +275,6 @@ func (c *client) dial(ctx context.Context) error {
 	c.pktConn = pktConn
 	c.tr = tr
 	c.conn = conn
-	c.aliveTCP = &atomic.Int64{}
-	c.lastAlive = time.Now()
 	c.udpSM = &udpSessionManager{
 		conn: conn,
 		m:    make(map[uint32]*InterConn),
@@ -276,6 +282,10 @@ func (c *client) dial(ctx context.Context) error {
 	}
 	if c.path != nil {
 		c.udpSM.budget = &mobileDatagramReceive
+		c.watchMobileConnection(conn)
+	} else {
+		c.aliveTCP = &atomic.Int64{}
+		c.lastAlive = time.Now()
 	}
 	go c.udpSM.run()
 	connected = true
@@ -316,8 +326,14 @@ func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
 		return nil, err
 	}
 
-	c.lastAlive = time.Now()
-	c.aliveTCP.Add(1)
+	var onClose func()
+	if c.mobileIdle != nil {
+		c.mobileIdle.acquire()
+		onClose = c.mobileIdle.release
+	} else {
+		c.lastAlive = time.Now()
+		c.aliveTCP.Add(1)
+	}
 	return &interConn{
 		stream: stream,
 		local:  c.conn.LocalAddr(),
@@ -326,6 +342,7 @@ func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
 		client:   true,
 		lock:     make(chan struct{}, 1),
 		aliveTCP: c.aliveTCP,
+		onClose:  onClose,
 	}, nil
 }
 
@@ -405,6 +422,9 @@ func (m *clientManager) clean() {
 		m.RUnlock()
 		for k, c := range entries {
 			force := c.instance != nil && !c.instance.IsRunning()
+			if c.path != nil && !force {
+				continue // The mobile connection owns its idle and socket cleanup.
+			}
 			c.clean(force)
 			if force {
 				m.Lock()
@@ -450,7 +470,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if internet.UsesMobileProfile(ctx) {
 		m = mobileManager
 	}
-	m.startOnce.Do(func() { go m.clean() })
+	if !internet.UsesEmbeddedMobileProfile(ctx) {
+		m.startOnce.Do(func() { go m.clean() })
+	}
 	return m.dial(ctx, dest, streamSettings)
 }
 
@@ -480,10 +502,14 @@ func (m *clientManager) dial(ctx context.Context, dest net.Destination, streamSe
 		}
 		c = m.m[dialerConfKey]
 		if c == nil {
+			var instance *core.Instance
+			if !internet.UsesEmbeddedMobileProfile(ctx) {
+				instance = core.FromContext(ctx)
+			}
 			c = &client{
 				lock:         make(chan struct{}, 1),
 				path:         m.path,
-				instance:     core.FromContext(ctx),
+				instance:     instance,
 				dest:         dest,
 				config:       streamSettings.ProtocolSettings.(*Config),
 				tlsConfig:    tlsConfig.GetTLSConfig(tls.WithDestination(dest)),

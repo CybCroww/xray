@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -19,6 +20,49 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
+
+func TestMobileHysteriaIdleDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		expired := make(chan uint64, 1)
+		idle := &mobileQUICIdle{expire: func(epoch uint64) { expired <- epoch }}
+		defer idle.stop()
+		idle.acquire()
+		idle.acquire()
+		idle.release()
+		time.Sleep(2 * net.ConnIdleTimeout)
+		synctest.Wait()
+		select {
+		case <-expired:
+			t.Fatal("an active flow did not keep its connection warm")
+		default:
+		}
+		idle.release()
+		time.Sleep(net.ConnIdleTimeout - time.Second)
+		idle.acquire()
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		select {
+		case <-expired:
+			t.Fatal("reusing the connection did not cancel its first deadline")
+		default:
+		}
+		idle.release()
+		time.Sleep(net.ConnIdleTimeout)
+		synctest.Wait()
+		select {
+		case epoch := <-expired:
+			if !idle.hasExpired(epoch) {
+				t.Fatal("the deadline did not match the idle connection")
+			}
+			idle.acquire()
+			if idle.hasExpired(epoch) {
+				t.Fatal("a delayed timeout could close a reused connection")
+			}
+		default:
+			t.Fatal("the connection stayed warm after its idle deadline")
+		}
+	})
+}
 
 func TestMobileHysteriaPathResetCancelsAuthentication(t *testing.T) {
 	entered := make(chan struct{}, 1)
@@ -148,10 +192,58 @@ func TestMobileHysteriaPathResetCancelsAuthentication(t *testing.T) {
 		t.Fatal(err)
 	}
 	activeQUIC := newClient.conn
+	idle := newClient.mobileIdle
 	newClient.unlock()
 	if err := activeQUIC.Context().Err(); err != nil {
 		t.Fatalf("new connection closed before its path was reset: %v", err)
 	}
+	udp, err := m.dial(ContextWithDatagram(newCtx, true), dest, settings)
+	if err != nil {
+		t.Fatalf("new network failed to open a UDP session: %v", err)
+	}
+	defer udp.Close()
+	fresh.Close()
+	idle.mu.Lock()
+	users, timed := idle.users, idle.timer != nil
+	idle.mu.Unlock()
+	if users != 1 || timed {
+		t.Fatal("closing TCP armed the timer while UDP still used the connection")
+	}
+	udp.Close()
+	idle.mu.Lock()
+	users, timed = idle.users, idle.timer != nil
+	idle.mu.Unlock()
+	if users != 0 || !timed {
+		t.Fatal("closing the last UDP session did not arm the timer")
+	}
+	activeQUIC.CloseWithError(closeErrCodeOK, "")
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := newClient.acquire(newCtx); err != nil {
+			t.Fatal(err)
+		}
+		retired := newClient.conn == nil && newClient.pktConn == nil && newClient.mobileIdle == nil
+		newClient.unlock()
+		if retired {
+			break
+		}
+		select {
+		case <-newCtx.Done():
+			t.Fatal("QUIC shutdown did not release its socket")
+		case <-ticker.C:
+		}
+	}
+	conn, err := m.dial(newCtx, dest, settings)
+	if err != nil {
+		t.Fatalf("failed to dial after QUIC shutdown: %v", err)
+	}
+	defer conn.Close()
+	if err := newClient.acquire(newCtx); err != nil {
+		t.Fatal(err)
+	}
+	activeQUIC = newClient.conn
+	newClient.unlock()
 	m.resetNetwork()
 	select {
 	case <-activeQUIC.Context().Done():
