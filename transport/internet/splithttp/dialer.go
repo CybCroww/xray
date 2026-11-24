@@ -72,7 +72,7 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 	if !found {
 		transportConfig := streamSettings.ProtocolSettings.(*Config)
 		xmuxManager = NewXmuxManager(transportConfig.Xmux, func() XmuxConn {
-			return createHTTPClient(dest, streamSettings, mobile)
+			return createHTTPClient(dest, streamSettings, path)
 		})
 		if mobile {
 			xmuxManager.maxPool = 2
@@ -104,7 +104,8 @@ func decideHTTPVersion(tlsConfig *tls.Config, realityConfig *reality.Config) str
 	return "2"
 }
 
-func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStreamConfig, mobile bool) DialerClient {
+func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStreamConfig, path context.Context) DialerClient {
+	mobile := path != nil
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
@@ -135,6 +136,18 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 	}
 
 	dialContext := func(ctxInner context.Context) (net.Conn, error) {
+		if mobile {
+			if err := path.Err(); err != nil {
+				return nil, err
+			}
+			// net/http can detach a shared dial from the initiating request.
+			// Keep TCP and TLS setup bounded and tied to this network path.
+			dialCtx, cancel := context.WithTimeout(ctxInner, clientConnectTimeout)
+			defer cancel()
+			stop := context.AfterFunc(path, cancel)
+			defer stop()
+			ctxInner = dialCtx
+		}
 		var conn net.Conn
 		var err error
 		if streamSettings.FinalMask != nil {
@@ -147,18 +160,28 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		}
 
 		if realityConfig != nil {
-			return reality.UClient(conn, realityConfig, ctxInner, dest)
-		}
-
-		if gotlsConfig != nil {
-			if fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint); fingerprint != nil {
+			conn, err = reality.UClient(conn, realityConfig, ctxInner, dest)
+			if err != nil {
+				return nil, err
+			}
+		} else if gotlsConfig != nil {
+			fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint)
+			if fingerprint != nil {
 				conn = tls.UClient(conn, gotlsConfig, fingerprint)
-				if err := conn.(*tls.UConn).HandshakeContext(ctxInner); err != nil {
+			} else {
+				conn = tls.Client(conn, gotlsConfig)
+			}
+			if mobile || fingerprint != nil {
+				if err := conn.(tls.Interface).HandshakeContext(ctxInner); err != nil {
 					conn.Close()
 					return nil, err
 				}
-			} else {
-				conn = tls.Client(conn, gotlsConfig)
+			}
+		}
+		if mobile {
+			if err := path.Err(); err != nil {
+				conn.Close()
+				return nil, err
 			}
 		}
 
@@ -285,6 +308,8 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 				MaxReceiveBufferPerStream:     512 << 10,
 			}}
 			h2 = common.Must2(http2.ConfigureTransports(h1))
+			// We call the HTTP/2 transport directly, so it must own the dials.
+			h2.ConnPool = nil
 			h2.DialTLSContext = func(ctx context.Context, _, _ string, _ *gotls.Config) (net.Conn, error) {
 				return dialContext(ctx)
 			}

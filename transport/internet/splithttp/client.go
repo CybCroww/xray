@@ -18,6 +18,8 @@ import (
 	"github.com/xtls/xray-core/common/signal/done"
 )
 
+const clientConnectTimeout = 12 * time.Second
+
 // interface to abstract between use of browser dialer, vs net/http
 type DialerClient interface {
 	IsClosed() bool
@@ -127,7 +129,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 		wrc.Set(resp.Body)
 	}()
 
-	timer := time.NewTimer(12 * time.Second)
+	timer := time.NewTimer(clientConnectTimeout)
 	defer timer.Stop()
 	select {
 	case r := <-ready:

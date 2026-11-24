@@ -24,6 +24,68 @@ type streamRoundTripper func(*http.Request) (*http.Response, error)
 
 func (f streamRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+func TestMobilePathChangeClosesPendingTLS(t *testing.T) {
+	for _, protocol := range []string{"http/1.1", "h2"} {
+		t.Run(protocol, func(t *testing.T) {
+			listener, err := stdnet.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			if err := listener.(*stdnet.TCPListener).SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			destination, err := net.ParseDestination("tcp:" + listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings := &internet.MemoryStreamConfig{
+				ProtocolName: "splithttp", SecurityType: "tls",
+				ProtocolSettings: &Config{Path: "/test/", Mode: "packet-up"},
+				SecuritySettings: &tls.Config{NextProtocol: []string{protocol}},
+			}
+			limits := newClientLimits(1, 1)
+			defer resetClientNetwork(limits)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			dialResult := make(chan error, 1)
+			go func() {
+				conn, err := dial(ctx, destination, settings, limits)
+				if conn != nil {
+					conn.Close()
+				}
+				dialResult <- err
+			}()
+			peer, err := listener.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer peer.Close()
+			if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			var record [5]byte
+			if _, err := io.ReadFull(peer, record[:]); err != nil || record[0] != 22 {
+				t.Fatalf("expected a TLS handshake record, got %v (%v)", record, err)
+			}
+			// Cancel the path before touching the pool. Closing the idle pool
+			// can incidentally cancel a dial, depending on request timing.
+			limits.path.change()
+			if _, err := io.Copy(io.Discard, peer); err != nil {
+				t.Fatalf("the old TLS socket stayed open after the path change: %v", err)
+			}
+			select {
+			case err := <-dialResult:
+				if err == nil {
+					t.Fatal("dial succeeded on a retired path")
+				}
+			case <-ctx.Done():
+				t.Fatal("the path change did not release the flow")
+			}
+		})
+	}
+}
+
 func TestMobileDownlinkHeaderDeadline(t *testing.T) {
 	const timeout = 200 * time.Millisecond
 	for _, tt := range []struct {
