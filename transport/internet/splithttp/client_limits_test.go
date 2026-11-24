@@ -125,7 +125,7 @@ func TestMobilePacketUploadsBackpressureAndCancel(t *testing.T) {
 		ProtocolSettings: &Config{Path: "/test", Mode: "packet-up", ScMinPostsIntervalMs: &RangeConfig{From: -1, To: -1}},
 		SecuritySettings: &tls.Config{PinnedPeerCertSha256: [][]byte{tls.GenerateCertHash(server.Certificate().Raw)}},
 	}
-	limits := &clientLimits{flows: make(chan struct{}, 2), packets: make(chan struct{}, budget)}
+	limits := newClientLimits(2, budget)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	first, err := dial(ctx, destination, settings, limits)
@@ -217,7 +217,7 @@ func TestMobilePacketUploadFailureReleasesFlow(t *testing.T) {
 		ProtocolSettings: &Config{Path: "/test", Mode: "packet-up"},
 		SecuritySettings: &tls.Config{PinnedPeerCertSha256: [][]byte{tls.GenerateCertHash(server.Certificate().Raw)}},
 	}
-	limits := &clientLimits{flows: make(chan struct{}, 1), packets: make(chan struct{}, 1)}
+	limits := newClientLimits(1, 1)
 	defer resetClientNetwork(limits)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -286,7 +286,7 @@ func TestMobilePacketUploadKeepsHeaderTransport(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	dialCtx, cancelDial := context.WithCancel(ctx)
-	conn, err := dial(dialCtx, destination, settings, &clientLimits{flows: make(chan struct{}, 1), packets: make(chan struct{}, 4)})
+	conn, err := dial(dialCtx, destination, settings, newClientLimits(1, 4))
 	cancelDial()
 	if err != nil {
 		t.Fatal(err)

@@ -571,22 +571,33 @@ func dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if maxUploadSize <= 0 {
 		return nil, errors.New("XHTTP upload packet size must be positive")
 	}
-	uploadPipeReader, uploadPipeWriter := pipe.New(pipe.WithSizeLimit(max(0, maxUploadSize-buf.Size)))
-	conn.writer = uploadWriter{uploadPipeWriter, maxUploadSize}
-	stopUpload := context.AfterFunc(connCtx, uploadPipeReader.Interrupt)
+	var uploadPipeReader *pipe.Reader
+	var queued *mobileUploadQueue
+	var stopUpload func() bool
+	if limits != nil {
+		queued = newMobileUploadQueue(connCtx, maxUploadSize, limits.queued)
+		conn.writer = queued
+	} else {
+		var uploadPipeWriter *pipe.Writer
+		uploadPipeReader, uploadPipeWriter = pipe.New(pipe.WithSizeLimit(max(0, maxUploadSize-buf.Size)))
+		conn.writer = uploadWriter{uploadPipeWriter, maxUploadSize}
+		stopUpload = context.AfterFunc(connCtx, uploadPipeReader.Interrupt)
+	}
 	if xmuxClient != nil {
 		xmuxClient.AddRunning()
 	}
 
 	go func() {
-		defer stopUpload()
+		if stopUpload != nil {
+			defer stopUpload()
+		}
 		dynamicHTTPClient := httpClient
 		dynamicXmuxClient := xmuxClient
 		if dynamicXmuxClient != nil {
 			defer func() { dynamicXmuxClient.DoneRunning() }()
 		}
 		requestURI := requestURL.String()
-		uploadPackets(connCtx, cancel, uploadPipeReader, maxUploadSize, transportConfiguration.GetNormalizedScMinPostsIntervalMs(), limits,
+		uploadPackets(connCtx, cancel, uploadPipeReader, queued, maxUploadSize, transportConfiguration.GetNormalizedScMinPostsIntervalMs(), limits,
 			func(requestCtx context.Context) (DialerClient, func()) {
 				if dynamicXmuxClient == nil {
 					return dynamicHTTPClient, func() {}

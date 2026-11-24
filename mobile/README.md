@@ -38,9 +38,11 @@ The extension has a 32 MiB Go runtime soft target by default. Packet storage is
 bounded independently of the garbage collector: a 128-packet input ring,
 capped TUN flow/queue sizes, a 512 KiB budget for incomplete IP packet buffers,
 a 2 MiB budget for queued UDP buffers (256 KiB per flow), and XHTTP upload
-limits. A stalled XHTTP `packet-up`
-peer blocks further writes once the outstanding request budget is exhausted;
-closing the flow cancels the requests. XHTTP keeps the configured uplink
+limits. XHTTP `packet-up` has a 2 MiB shared budget for pending uplink
+buffers, with one pending packet per flow. At most 24 HTTP uploads can
+be in flight across the process. Writes wait for queue capacity when the
+peer stalls, and closing the flow returns its buffers and cancels its
+requests. XHTTP keeps the configured uplink
 method, session/payload placement, authentication, host and path. The smaller
 packet sizes reduce the maximum transfer rate at a given request interval, so
 measure throughput in addition to memory before changing these defaults.

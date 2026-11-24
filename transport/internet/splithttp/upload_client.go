@@ -11,6 +11,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/pipe"
+	"golang.org/x/sync/semaphore"
 )
 
 // The flight slots cover the whole request, including a stalled response, rather
@@ -18,6 +19,7 @@ import (
 type clientLimits struct {
 	flows   chan struct{}
 	packets chan struct{}
+	queued  *semaphore.Weighted
 	stats   uploadCounters
 	path    clientPath
 }
@@ -36,7 +38,16 @@ func MobileUploadStats() (requests, bytes, failures uint64) {
 	return stats.requests.Load(), stats.bytes.Load(), stats.failures.Load()
 }
 
-var mobileLimits = &clientLimits{flows: make(chan struct{}, 64), packets: make(chan struct{}, 24)}
+const mobileQueuedUploadBytes = 2 << 20
+
+func newClientLimits(flows, packets int) *clientLimits {
+	return &clientLimits{
+		flows: make(chan struct{}, flows), packets: make(chan struct{}, packets),
+		queued: semaphore.NewWeighted(mobileQueuedUploadBytes),
+	}
+}
+
+var mobileLimits = newClientLimits(64, 24)
 
 func platformClientLimits() *clientLimits {
 	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
@@ -74,19 +85,33 @@ func packetSize(config *Config, limits *clientLimits) int32 {
 	}
 }
 
-func uploadPackets(ctx context.Context, cancel context.CancelFunc, reader *pipe.Reader, size int32, interval *RangeConfig, limits *clientLimits, selectClient func(context.Context) (DialerClient, func()), requestURI, sessionID string) {
+func uploadPackets(ctx context.Context, cancel context.CancelFunc, reader *pipe.Reader, queued *mobileUploadQueue, size int32, interval *RangeConfig, limits *clientLimits, selectClient func(context.Context) (DialerClient, func()), requestURI, sessionID string) {
 	parallel := 8
 	if limits != nil {
 		parallel = 3
 	}
 	local := make(chan struct{}, parallel)
+	releaseSlots := func() {
+		<-local
+		if limits != nil {
+			<-limits.packets
+		}
+	}
 	var seq int64
 	var lastWrite time.Time
 	var remainder buf.MultiBuffer
 	defer func() { buf.ReleaseMulti(remainder) }()
-	defer reader.Interrupt()
+	if queued != nil {
+		defer queued.Close()
+	} else {
+		defer reader.Interrupt()
+	}
 	for ctx.Err() == nil {
-		if remainder.IsEmpty() {
+		if queued != nil {
+			if !queued.wait() {
+				return
+			}
+		} else if remainder.IsEmpty() {
 			var err error
 			remainder, err = reader.ReadMultiBuffer()
 			if err != nil {
@@ -111,14 +136,16 @@ func uploadPackets(ctx context.Context, cancel context.CancelFunc, reader *pipe.
 			<-local
 			return
 		}
-		if limits != nil && remainder.Len() < size {
-			// Read once after waiting for both the configured interval and a
-			// request slot. This batches new writes without any extra latency or
-			// timer, and pulling once preserves the upload queue's memory bound.
-			remainder, _ = buf.MergeMulti(remainder, reader.TryReadMultiBuffer())
-		}
 		var chunk buf.MultiBuffer
-		remainder, chunk = buf.SplitSize(remainder, size)
+		if queued != nil {
+			chunk = queued.take(false)
+			if chunk.IsEmpty() {
+				releaseSlots()
+				return
+			}
+		} else {
+			remainder, chunk = buf.SplitSize(remainder, size)
+		}
 		if limits != nil {
 			limits.stats.requests.Add(1)
 			limits.stats.bytes.Add(uint64(chunk.Len()))
@@ -136,18 +163,12 @@ func uploadPackets(ctx context.Context, cancel context.CancelFunc, reader *pipe.
 		client, releaseClient := selectClient(ctx)
 		if client == nil {
 			buf.ReleaseMulti(chunk)
-			<-local
-			if limits != nil {
-				<-limits.packets
-			}
+			releaseSlots()
 			return
 		}
 		go func() {
 			defer func() {
-				<-local
-				if limits != nil {
-					<-limits.packets
-				}
+				releaseSlots()
 				signalWritten()
 			}()
 			defer releaseClient()
