@@ -1,6 +1,8 @@
 package tun
 
 import (
+	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -146,6 +148,31 @@ func TestMobileUDPQueuesShareByteBudget(t *testing.T) {
 	u.reset(false)
 	if len(u.udpConns) != 0 || u.queueBytes.retained.Load() != 0 {
 		t.Fatal("path reset did not recover the shared UDP budget")
+	}
+}
+
+func TestMobileUDPResetRejectsLateReplies(t *testing.T) {
+	writes := 0
+	u := newUdpConnectionHandler(func(net.Conn, net.Destination) {}, func([]byte, net.Destination, net.Destination) error {
+		writes++
+		return nil
+	})
+	u.queueBytes = new(udpQueueBudget)
+	defer u.closeAll()
+	src := net.UDPDestination(net.ParseAddress("198.18.0.2"), 40000)
+	dst := net.UDPDestination(net.ParseAddress("192.0.2.1"), 53)
+	u.HandlePacket(src, dst, buf.MergeBytes(nil, []byte("query"))[0])
+	old := u.udpConns[src]
+	u.reset(false)
+	u.HandlePacket(src, dst, buf.MergeBytes(nil, []byte("new query"))[0])
+	if _, err := old.Write([]byte("late response")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("old upstream could write back into the new flow: %v", err)
+	}
+	if err := old.WriteMultiBuffer(buf.MergeBytes(nil, []byte("late buffered response"))); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("old buffered reply could write back into the new flow: %v", err)
+	}
+	if _, err := u.udpConns[src].Write([]byte("new response")); err != nil || writes != 1 {
+		t.Fatalf("want exactly one reply from the new flow, got %d, %v", writes, err)
 	}
 }
 

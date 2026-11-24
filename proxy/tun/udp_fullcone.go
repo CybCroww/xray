@@ -178,7 +178,7 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				dst = *b.UDP
 			}
 		}
-		err := c.handler.writePacket(b.Bytes(), dst, c.src)
+		err := c.writeReply(b.Bytes(), dst)
 		if err != nil {
 			buf.ReleaseMulti(mb[i:])
 			return err
@@ -190,13 +190,24 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 
 // Write returning packets back
 func (c *udpConn) Write(p []byte) (int, error) {
-	// sending packets back mean sending payload with source/destination reversed
-	err := c.handler.writePacket(p, c.dst, c.src)
-	if err != nil {
+	if err := c.writeReply(p, c.dst); err != nil {
 		return 0, err
 	}
-
 	return len(p), nil
+}
+
+func (c *udpConn) writeReply(payload []byte, from net.Destination) error {
+	u := c.handler
+	if c.queue.budget != nil {
+		// A network change can replace the flow while its upstream still has
+		// a reply in flight. Keep writes and removal ordered for this port.
+		u.RLock()
+		defer u.RUnlock()
+		if u.udpConns[c.src] != c {
+			return io.ErrClosedPipe
+		}
+	}
+	return u.writePacket(payload, from, c.src)
 }
 
 func (c *udpConn) Close() error {
