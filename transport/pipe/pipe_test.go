@@ -49,6 +49,28 @@ func TestPipeInterrupt(t *testing.T) {
 	}
 }
 
+func TestNestedTimeoutReadersForwardInterrupt(t *testing.T) {
+	input, _ := New()
+	reader := &buf.TimeoutWrapperReader{Reader: &buf.TimeoutWrapperReader{Reader: input}}
+	result := make(chan error, 1)
+	go func() {
+		mb, err := reader.ReadMultiBufferTimeout(time.Hour)
+		buf.ReleaseMulti(mb)
+		result <- err
+	}()
+	if err := common.Interrupt(reader); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != io.ErrClosedPipe {
+			t.Fatalf("interrupted read returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("nested reader kept waiting after interruption")
+	}
+}
+
 func TestPipeClose(t *testing.T) {
 	pReader, pWriter := New(WithSizeLimit(1024))
 	payload := []byte{'a', 'b', 'c', 'd'}
