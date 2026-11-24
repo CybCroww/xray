@@ -152,6 +152,8 @@ type tcpConn struct {
 	closed bool
 	// err is why the connection is gone
 	err error
+	// cancelFlow stops the embedded tunnel's upstream dial on a local abort.
+	cancelFlow context.CancelFunc
 
 	rcvNxt uint32
 	// rcvAcked is the last acknowledgment number sent
@@ -1081,6 +1083,13 @@ func (c *tcpConn) abort(err error) {
 		return
 	}
 	c.err = err
+	if c.cancelFlow != nil {
+		if err == errTCPReset || err == errTCPTimeout {
+			c.cancelFlow()
+			c.discardUnread()
+		}
+		c.cancelFlow = nil
+	}
 	if c.timer != nil {
 		c.timer.Stop()
 	}
@@ -1266,6 +1275,22 @@ func (c *tcpConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func (c *tcpConn) bindCancel(cancel context.CancelFunc) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.err != nil {
+		return false
+	}
+	c.cancelFlow = cancel
+	return true
+}
+
+// discardUnread clears payload from an abandoned flow. c.mu is held.
+func (c *tcpConn) discardUnread() {
+	buf.ReleaseMulti(c.rcvQueue)
+	c.rcvQueue, c.rcvLen = nil, 0
+}
+
 // Close implements net.Conn
 func (c *tcpConn) Close() error {
 	c.mu.Lock()
@@ -1275,7 +1300,7 @@ func (c *tcpConn) Close() error {
 	}
 	c.closed = true
 	unread := c.rcvLen > 0
-	c.rcvQueue, c.rcvLen = buf.ReleaseMulti(c.rcvQueue), 0
+	c.discardUnread()
 	if c.err != nil {
 		return nil
 	}

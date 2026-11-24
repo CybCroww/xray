@@ -1181,6 +1181,30 @@ func TestTCPResetPreservesBufferUntilDeviceWriteReturns(t *testing.T) {
 	}
 }
 
+func TestTCPNetworkResetDiscardsUnreadData(t *testing.T) {
+	conns := make(chan accepted, 1)
+	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
+	s := newTestStack(t, l, accept(conns))
+	p.connect(nil)
+	conn := take(t, conns).conn.(*tcpConn)
+	defer conn.Close()
+	payload := []byte("unread data from the old path")
+	p.send(p.seq, tcpAck|tcpPsh, nil, payload)
+	if seg := p.receive(); seg.flags != tcpAck || seg.ack != p.seq+uint32(len(payload)) {
+		t.Fatalf("old packet was not queued: flags %d, ack %d", seg.flags, seg.ack)
+	}
+	s.ResetFlows()
+	if seg := p.receive(); seg.flags != tcpAck|tcpRst {
+		t.Fatalf("old connection was not reset: flags %d", seg.flags)
+	}
+	queued, err := conn.ReadMultiBuffer()
+	if !queued.IsEmpty() || err != io.ErrClosedPipe {
+		buf.ReleaseMulti(queued)
+		t.Fatalf("read returned stale data after reset: %v", err)
+	}
+	forgotten(t, s)
+}
+
 // A keepalive is answered, and not before a segment that was made before it is written.
 func TestTCPKeepalive(t *testing.T) {
 	conns := make(chan accepted, 1)

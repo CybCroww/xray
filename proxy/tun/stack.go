@@ -155,6 +155,10 @@ func (s *stack) ResetFlows() {
 	}
 	for _, c := range conns {
 		c.mu.Lock()
+		// A path reset abandons the flow, including data that no dispatcher
+		// has read yet. An ordinary TCP reset can still drain received data.
+		c.discardUnread()
+		c.rcvFin = false
 		if c.err == nil {
 			c.reset()
 		}

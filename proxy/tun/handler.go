@@ -264,6 +264,9 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if tcp, ok := conn.(*tcpConn); ok && t.flowReset.register != nil && !tcp.bindCancel(cancel) {
+		return
+	}
 	if udp, ok := conn.(*udpConn); ok && udp.queue.budget != nil && !udp.bindCancel(cancel) {
 		return
 	}

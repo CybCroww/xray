@@ -3,7 +3,9 @@ package tun
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -271,6 +273,66 @@ func TestNetworkResetRetiresTransportsBeforeDispatch(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("new flow did not start after the reset")
 	}
+}
+
+func TestRetiredTCPDoesNotDispatchOnNewNetwork(t *testing.T) {
+	dispatcher := &capturingDispatcher{started: make(chan context.Context, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handler := &Handler{
+		ctx:        ctx,
+		flowCtx:    ctx,
+		flowReset:  flowReset{register: func(func(bool)) {}},
+		config:     &Config{},
+		dispatcher: dispatcher,
+	}
+	conn := newTCPConn(&stack{mtu: testMTU, window: tcpWindow}, flow{
+		src: netip.MustParseAddrPort("198.18.0.2:34000"),
+		dst: netip.MustParseAddrPort("192.0.2.1:443"),
+	})
+	conn.err = io.ErrClosedPipe // The path reset completed before this goroutine ran.
+	done := make(chan struct{})
+	go func() {
+		handler.HandleConnection(conn, conn.dst)
+		close(done)
+	}()
+	select {
+	case <-dispatcher.started:
+		t.Fatal("reset TCP flow was dispatched using the new network")
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not close the reset flow")
+	}
+}
+
+func TestMobileTCPResetCancelsUpstreamBeforeDialCompletes(t *testing.T) {
+	dispatcher := &capturingDispatcher{started: make(chan context.Context, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handler := &Handler{ctx: ctx, flowCtx: ctx, config: &Config{}, dispatcher: dispatcher,
+		flowReset: flowReset{register: func(func(bool)) {}},
+	}
+	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:443")
+	s := newTestStack(t, l, handler.HandleConnection)
+	p.connect(nil)
+	var upstream context.Context
+	select {
+	case upstream = <-dispatcher.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream dial did not start")
+	}
+	p.send(p.seq, tcpAck|tcpFin, nil, nil)
+	p.seq++
+	if seg := p.receive(); seg.flags != tcpAck || seg.ack != p.seq || upstream.Err() != nil {
+		t.Fatal("a graceful half-close interrupted the upstream")
+	}
+	p.send(p.seq, tcpRst, nil, nil)
+	select {
+	case <-upstream.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("TCP reset did not cancel the stalled upstream dial")
+	}
+	forgotten(t, s)
 }
 
 func (d *blockingDispatcher) DispatchLink(ctx context.Context, dest xnet.Destination, link *transport.Link) error {
