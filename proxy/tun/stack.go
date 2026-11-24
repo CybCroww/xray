@@ -65,6 +65,8 @@ type stack struct {
 	// window is the window of every connection
 	window int32
 	maxTCP int
+	// Schedule TCP work at its deadlines on embedded mobile packet flows.
+	deadlineTimers bool
 	// verify is set if the checksums of what comes are looked at
 	verify bool
 	// stamps is set if connections carry the times of RFC 7323 when the other side does
@@ -117,6 +119,7 @@ func NewStack(ctx context.Context, options StackOptions, handler ConnectionHandl
 	if options.LowMemory {
 		s.window = 64 << 10
 		s.maxTCP = 96
+		s.deadlineTimers = true
 		s.fragments.byteLimit = mobileFragmentBytes
 	}
 	for i := range s.identification {
@@ -392,12 +395,14 @@ func (s *stack) handleTCP(p packet) {
 		// Ignore this SYN so the system can retry if capacity becomes available.
 		return
 	}
+	s.opening.Add(1)
 	s.conns[f] = c
 	s.mu.Unlock()
-	s.opening.Add(1)
 	c.mu.Lock()
-	c.sendSyn()
-	c.arm(tcpTick)
+	if c.err == nil {
+		c.sendSyn()
+		c.armRetransmission()
+	}
 	c.mu.Unlock()
 }
 

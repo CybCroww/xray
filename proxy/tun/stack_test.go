@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -1074,6 +1075,84 @@ func TestTCPZeroWindowDoesNotPollOrDelayOtherTimers(t *testing.T) {
 	case <-time.After(9 * tcpTick):
 		t.Fatal("retransmission still waiting on the probe timer")
 	}
+}
+
+func TestMobileTCPDeadlineTimer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conns := make(chan accepted, 1)
+		p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
+		s, err := NewStack(context.Background(), StackOptions{Tun: l, MTU: testMTU, LowMemory: true}, handler(accept(conns)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { s.Close(); l.Close() }()
+		p.connect(nil)
+		conn := take(t, conns).conn.(*tcpConn)
+		conn.mu.Lock()
+		conn.retransmitTicks = tcpRetransmitTicksOpen
+		conn.mu.Unlock()
+		start := time.Now()
+		if _, err := conn.Write([]byte("out")); err != nil {
+			t.Fatal(err)
+		}
+		if seg := p.receive(); string(seg.payload) != "out" {
+			t.Fatal("first write did not reach the peer")
+		}
+		time.Sleep(5 * tcpTick)
+		synctest.Wait()
+		conn.mu.Lock()
+		stalled, due := conn.stalled, conn.timerAt
+		conn.mu.Unlock()
+		retryDelay := tcpRetransmitTicksOpen * tcpTick
+		if stalled != 0 || !due.Equal(start.Add(retryDelay)) {
+			t.Fatalf("timer polled during retry wait: ticks=%d, deadline=%s", stalled, due.Sub(start))
+		}
+
+		// Incoming data needs a delayed ACK before the outbound retry is due.
+		receivedAt := time.Now()
+		p.send(p.seq, tcpAck, nil, []byte("in"))
+		p.seq += 2
+		if seg := p.receive(); seg.flags != tcpAck || seg.ack != p.seq || time.Since(receivedAt) != tcpTick {
+			t.Fatalf("delayed ACK missed its deadline after %s", time.Since(receivedAt))
+		}
+		if seg := p.receive(); string(seg.payload) != "out" || seg.seq != p.ack || time.Since(start) != retryDelay {
+			t.Fatalf("retransmission missed its deadline after %s", time.Since(start))
+		}
+		p.ack += 3
+		p.send(p.seq, tcpAck, nil, nil)
+		synctest.Wait()
+		conn.mu.Lock()
+		active := !conn.timerAt.IsZero()
+		conn.mu.Unlock()
+		if active {
+			t.Fatal("acknowledged flow left a timer armed")
+		}
+
+		read(t, conn, "in")
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if seg := p.receive(); seg.flags != tcpFin|tcpAck {
+			t.Fatal("closing the flow did not send FIN")
+		}
+		p.ack++
+		p.send(p.seq, tcpAck, nil, nil)
+		synctest.Wait()
+		conn.mu.Lock()
+		linger := time.Until(conn.timerAt)
+		conn.mu.Unlock()
+		if linger != tcpLinger {
+			t.Fatalf("FIN acknowledgment scheduled the wrong linger interval: %s", linger)
+		}
+		time.Sleep(tcpLinger)
+		if seg := p.receive(); seg.flags != tcpRst|tcpAck {
+			t.Fatal("unclosed peer was not reset after linger")
+		}
+		forgotten(t, s.(*stack))
+	})
 }
 
 func TestTCPWriteReleasesAcknowledgedBuffersWhileBlocked(t *testing.T) {

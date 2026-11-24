@@ -53,7 +53,7 @@ const (
 	// is copied to where the one before it ends, for a reader to get buffers that are full
 	tcpKept = buf.Size / 2
 
-	// tcpTick is how often a connection that waits for something looks at what it waits for
+	// tcpTick is the granularity of ACK and retransmission delays.
 	tcpTick = 100 * time.Millisecond
 	// ticks without anything acknowledged before it is sent again, twice as many every next time, a minute at most,
 	// while an open connection that waits sends again every two seconds at most or as often as an answer takes,
@@ -209,6 +209,9 @@ type tcpConn struct {
 	srtt, rttvar time.Duration
 
 	timer *time.Timer
+	// The mobile timer waits for the earliest of a delayed ACK, a retry, or
+	// the end of FIN linger. retryAt also holds the linger deadline.
+	timerAt, ackAt, retryAt time.Time
 	// The window probe has its own timer so it cannot delay ACKs or
 	// retransmissions when the window reopens.
 	windowProbeTimer *time.Timer
@@ -293,13 +296,13 @@ func (s *stack) DialTCP(ctx context.Context, remote netip.AddrPort) (net.Conn, e
 	c := newTCPConn(s, f)
 	// what the SYN offers, until the answer says what of it is taken
 	c.sack, c.stamps, c.rcvShift, c.opened = true, s.stamps, tcpWindowShift, opened
+	s.opening.Add(1)
 	s.conns[f] = c
 	s.mu.Unlock()
-	s.opening.Add(1)
 	c.mu.Lock()
 	if c.err == nil {
 		c.sendSyn()
-		c.arm(tcpTick)
+		c.armRetransmission()
 	}
 	c.mu.Unlock()
 
@@ -356,6 +359,10 @@ func (c *tcpConn) header(b []byte, seq uint32, flags byte, options []byte, size 
 	setIPLength(b[:n], n+len(t)+size)
 	c.rcvAcked = c.rcvNxt
 	c.rcvAdvertised = window
+	if !c.ackAt.IsZero() {
+		c.ackAt = time.Time{}
+		c.scheduleDeadline()
+	}
 	return n + len(t)
 }
 
@@ -481,6 +488,7 @@ func (c *tcpConn) input(s segment) bool {
 			close(c.opened)
 			c.opened = nil
 			c.sendAck()
+			c.refreshRetransmission()
 		}
 		return true
 	}
@@ -526,6 +534,7 @@ func (c *tcpConn) input(s segment) bool {
 			c.clocked()
 		}
 		c.stack.opening.Add(-1)
+		c.refreshRetransmission()
 		go c.stack.handle(c, c.dst)
 	} else {
 		c.acknowledge(s)
@@ -615,9 +624,13 @@ func (c *tcpConn) acknowledge(s segment) {
 			if start, end := c.hole(c.sndUna); start == c.sndUna && start != end {
 				c.retransmit(start, start+min(end-start, uint32(c.mss)))
 				c.headAt, c.stalled = time.Time{}, 0
+				c.refreshRetransmission()
 			}
 		}
 		c.resend()
+	}
+	if acked != 0 {
+		c.refreshRetransmission()
 	}
 	c.sndWnd = window
 	if c.windowProbeArmed && window != 0 && c.windowProbeTimer.Stop() {
@@ -754,6 +767,7 @@ func (c *tcpConn) resend() {
 		if start == c.sndUna {
 			// its answer is waited for from now on
 			c.headAt, c.stalled = time.Now(), 0
+			c.refreshRetransmission()
 		}
 		c.retransmit(start, end)
 		c.resent = end
@@ -846,7 +860,7 @@ func (c *tcpConn) receive(s segment) {
 	if fin || now || c.rcvNxt-c.rcvAcked >= uint32(c.window/4) {
 		c.sendAck()
 	} else {
-		c.arm(tcpTick)
+		c.armDelayedAck()
 	}
 }
 
@@ -991,6 +1005,126 @@ func (c *tcpConn) arm(d time.Duration) {
 	}
 }
 
+func (c *tcpConn) armDelayedAck() {
+	if !c.stack.deadlineTimers {
+		c.arm(tcpTick)
+	} else if c.ackAt.IsZero() {
+		c.ackAt = time.Now().Add(tcpTick)
+		c.scheduleDeadline()
+	}
+}
+
+func (c *tcpConn) armRetransmission() {
+	if !c.stack.deadlineTimers {
+		c.arm(tcpTick)
+	} else if c.retryAt.IsZero() {
+		c.refreshRetransmission()
+	}
+}
+
+// Called when acknowledgments advance or a retransmission replaces the
+// oldest packet in flight. If the FIN is acknowledged, only linger remains.
+func (c *tcpConn) refreshRetransmission() {
+	if !c.stack.deadlineTimers {
+		return
+	}
+	switch {
+	case c.sndUna != c.sndNxt:
+		c.retryAt = time.Now().Add(time.Duration(c.retryTicks()) * tcpTick)
+	case c.closed && c.sndFin:
+		c.retryAt = time.Now().Add(tcpLinger)
+	default:
+		c.retryAt = time.Time{}
+	}
+	c.scheduleDeadline()
+}
+
+// scheduleDeadline is called with c.mu held. A stale callback that overlaps
+// a timer reset checks the deadline again before doing any work.
+func (c *tcpConn) scheduleDeadline() {
+	when := c.retryAt
+	if !c.ackAt.IsZero() && (when.IsZero() || c.ackAt.Before(when)) {
+		when = c.ackAt
+	}
+	if when.Equal(c.timerAt) {
+		return
+	}
+	c.timerAt = when
+	switch {
+	case when.IsZero():
+		c.timer.Stop()
+	case c.timer == nil:
+		c.timer = time.AfterFunc(time.Until(when), c.deadlineTick)
+	default:
+		c.timer.Reset(time.Until(when))
+	}
+}
+
+func (c *tcpConn) deadlineTick() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if c.err != nil || c.timerAt.IsZero() || now.Before(c.timerAt) {
+		return
+	}
+	c.timerAt = time.Time{}
+	if !c.ackAt.IsZero() && !now.Before(c.ackAt) {
+		c.ackAt = time.Time{}
+		if c.rcvAcked != c.rcvNxt {
+			c.sendAck()
+		}
+	}
+	if !c.retryAt.IsZero() && !now.Before(c.retryAt) {
+		c.retryAt = time.Time{}
+		if c.sndUna == c.sndNxt {
+			c.reset() // FIN linger expired.
+			return
+		}
+		c.retransmitOnTimeout(c.retryTicks())
+		if c.err != nil {
+			return
+		}
+		c.armRetransmission()
+	}
+	c.scheduleDeadline()
+}
+
+func (c *tcpConn) retryTicks() int {
+	ticks := c.retransmitTicks
+	if c.established && c.retransmits > 0 {
+		ticks = min(ticks, max(tcpRetransmitTicksOpen, c.answerTicks())<<(c.lostTicks/tcpMinuteTicks))
+	}
+	return ticks
+}
+
+func (c *tcpConn) retransmitOnTimeout(waited int) {
+	if c.retransmits++; c.retransmits == 1 {
+		c.lostTicks = 0
+	} else {
+		c.lostTicks += waited
+	}
+	if c.established && c.lostTicks > tcpGiveUpTicks || !c.established && c.retransmits > tcpSynRetransmits {
+		c.abort(errTCPTimeout)
+		return
+	}
+	c.stalled = 0
+	c.retransmitTicks = min(c.retransmitTicks*2, tcpRetransmitTicksMost)
+	if !c.established {
+		c.sendSyn()
+		c.timedAt = time.Time{}
+		return
+	}
+	// What the system did not acknowledge is lost. Cut the slow-start
+	// threshold unless the loss was already accounted for.
+	ssthresh, recovering := c.ssthresh, c.recovering
+	c.congested()
+	if recovering {
+		c.ssthresh = ssthresh
+	}
+	c.cwnd, c.lost = uint32(c.mss), c.sndNxt
+	c.resend()
+}
+
 // tick does what was put off and what has to be done again
 func (c *tcpConn) tick() {
 	c.mu.Lock()
@@ -1005,38 +1139,12 @@ func (c *tcpConn) tick() {
 	switch {
 	case c.sndUna != c.sndNxt:
 		c.stalled++
-		due := c.stalled >= c.retransmitTicks
-		if c.established && c.retransmits > 0 {
-			due = due || c.stalled >= max(tcpRetransmitTicksOpen, c.answerTicks())<<(c.lostTicks/tcpMinuteTicks)
+		if c.stalled >= c.retryTicks() {
+			c.retransmitOnTimeout(c.stalled)
 		}
-		if due {
-			if c.retransmits++; c.retransmits == 1 {
-				c.lostTicks = 0
-			} else {
-				c.lostTicks += c.stalled
-			}
-			if c.established && c.lostTicks > tcpGiveUpTicks || !c.established && c.retransmits > tcpSynRetransmits {
-				c.abort(errTCPTimeout)
-				return
-			}
-			c.stalled = 0
-			c.retransmitTicks = min(c.retransmitTicks*2, tcpRetransmitTicksMost)
-			if !c.established {
-				c.sendSyn()
-				c.timedAt = time.Time{}
-			} else {
-				// what the system does not say it has is lost, and the way to it is tried with a segment again.
-				// It takes half of what it took before the loss, not half of that again if the loss was seen already
-				ssthresh, recovering := c.ssthresh, c.recovering
-				c.congested()
-				if recovering {
-					c.ssthresh = ssthresh
-				}
-				c.cwnd, c.lost = uint32(c.mss), c.sndNxt
-				c.resend()
-			}
+		if c.err == nil {
+			c.arm(tcpTick)
 		}
-		c.arm(tcpTick)
 	case c.closed:
 		if c.lingered {
 			c.reset()
@@ -1235,7 +1343,7 @@ func (c *tcpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if c.timedAt.IsZero() {
 			c.timed, c.timedAt = c.sndNxt, time.Now()
 		}
-		c.arm(tcpTick)
+		c.armRetransmission()
 		// segments that come in the meantime are taken while this one is written, and acknowledged after it
 		c.sending = true
 		c.mu.Unlock()
@@ -1313,7 +1421,7 @@ func (c *tcpConn) Close() error {
 	c.send(c.sndNxt, tcpFin|tcpAck, nil, nil)
 	c.sndFin = true
 	c.sndNxt++
-	c.arm(tcpTick)
+	c.armRetransmission()
 	return nil
 }
 
