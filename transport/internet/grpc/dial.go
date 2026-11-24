@@ -189,9 +189,7 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		}))
 	}
 
-	if grpcSettings.InitialWindowsSize > 0 {
-		dialOptions = append(dialOptions, grpc.WithInitialWindowSize(grpcSettings.InitialWindowsSize))
-	}
+	dialOptions = appendReceiveWindowOptions(dialOptions, grpcSettings.InitialWindowsSize, runtime.GOOS == "ios" || runtime.GOOS == "android")
 
 	var grpcDestHost string
 	if dest.Address.Family().IsDomain() {
@@ -222,6 +220,21 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		globalDialerMap[dialerConf{dest, streamSettings}] = conn
 	}
 	return conn, err
+}
+
+func appendReceiveWindowOptions(options []grpc.DialOption, configured int32, mobile bool) []grpc.DialOption {
+	if mobile {
+		const streamLimit, connLimit = 256 << 10, 2 << 20
+		window := int32(streamLimit)
+		if configured >= 65535 {
+			window = min(configured, streamLimit)
+		}
+		return append(options, grpc.WithStaticStreamWindowSize(window), grpc.WithStaticConnWindowSize(connLimit))
+	}
+	if configured > 0 {
+		options = append(options, grpc.WithInitialWindowSize(configured))
+	}
+	return options
 }
 
 // setUserAgent overrides the user-agent on a ClientConn to remove the

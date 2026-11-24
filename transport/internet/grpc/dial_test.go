@@ -1,6 +1,7 @@
 package grpc
 
 import (
+	"bytes"
 	"context"
 	"strconv"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/grpc/encoding"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func TestNetworkResetRetiresSharedGRPCChannel(t *testing.T) {
@@ -32,6 +34,47 @@ func TestNetworkResetRetiresSharedGRPCChannel(t *testing.T) {
 	fresh, err := getGrpcClient(context.Background(), destination, settings)
 	if err != nil || fresh == old || fresh.GetState() == connectivity.Shutdown {
 		t.Fatalf("new channel failed: %v", err)
+	}
+}
+
+type largeResponseServer struct {
+	encoding.UnimplementedGRPCServiceServer
+	payload []byte
+}
+
+func (s largeResponseServer) Tun(stream encoding.GRPCService_TunServer) error {
+	return stream.Send(&encoding.Hunk{Data: s.payload})
+}
+
+func TestMobileGRPCReceivesMessageLargerThanWindow(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	payload := bytes.Repeat([]byte("x"), 768<<10)
+	server := grpc.NewServer()
+	defer server.Stop()
+	encoding.RegisterGRPCServiceServer(server, largeResponseServer{payload: payload})
+	go server.Serve(listener)
+	options := appendReceiveWindowOptions([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, 0, true)
+	channel, err := grpc.NewClient("passthrough:///"+listener.Addr().String(), options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer channel.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := encoding.NewGRPCServiceClient(channel).Tun(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reply.Data, payload) {
+		t.Fatalf("received %d bytes, expected %d", len(reply.Data), len(payload))
 	}
 }
 

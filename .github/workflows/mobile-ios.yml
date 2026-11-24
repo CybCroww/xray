@@ -23,6 +23,7 @@ jobs:
         run: >
           go test -race ./mobile ./proxy/tun
           ./transport/internet/grpc/... ./transport/internet/hysteria
+          ./transport/internet/internal/quicconfig
           ./transport/internet/splithttp ./transport/internet/tcp ./transport/internet/websocket
       - name: Build iPhone and simulator framework
         run: |

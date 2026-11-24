@@ -24,6 +24,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/browser_dialer"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
+	"github.com/xtls/xray-core/transport/internet/internal/quicconfig"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -184,10 +185,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			ChromeParrot:                   !quicParams.DisableChromeParrot,
 		}
 		if mobile {
-			quicConfig.InitialStreamReceiveWindow = mobileWindow(quicConfig.InitialStreamReceiveWindow, 512<<10)
-			quicConfig.MaxStreamReceiveWindow = max(quicConfig.InitialStreamReceiveWindow, mobileWindow(quicConfig.MaxStreamReceiveWindow, 512<<10))
-			quicConfig.InitialConnectionReceiveWindow = mobileWindow(quicConfig.InitialConnectionReceiveWindow, 2<<20)
-			quicConfig.MaxConnectionReceiveWindow = max(quicConfig.InitialConnectionReceiveWindow, mobileWindow(quicConfig.MaxConnectionReceiveWindow, 2<<20))
+			quicconfig.LimitMobileReceiveWindow(quicConfig)
 		}
 		if quicParams.MaxIdleTimeout == 0 {
 			quicConfig.MaxIdleTimeout = net.ConnIdleTimeout
@@ -238,7 +236,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 				tr := &quic.Transport{Conn: pktConn, DisableGSO: quicParams.DisableGSO}
 
-				if !quicParams.DisableChromeParrot {
+				if cfg.ChromeParrot {
 					tr.ConnectionIDGenerator = quic.ZeroLengthConnectionIDGenerator{}
 					tlsCfg.GetCertificate = nil
 				}
@@ -344,13 +342,6 @@ func init() {
 			globalDialerAccess.Unlock()
 		}
 	}()
-}
-
-func mobileWindow(configured, limit uint64) uint64 {
-	if configured == 0 {
-		return limit
-	}
-	return min(configured, limit)
 }
 
 // TrimIdleClients drops mobile connection pools that have no users. Active

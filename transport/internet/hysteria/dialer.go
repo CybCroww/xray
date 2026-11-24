@@ -23,6 +23,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
+	"github.com/xtls/xray-core/transport/internet/internal/quicconfig"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
@@ -113,6 +114,12 @@ func (c *client) dial(ctx context.Context) error {
 	if quicParams.MaxConnReceiveWindow == 0 {
 		quicConfig.MaxConnectionReceiveWindow = 8388608 * 5 / 2
 	}
+	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
+		if quicConfig.ChromeParrot {
+			quicConfig.OmitMaxDatagramFrameSize = false
+		}
+		quicconfig.LimitMobileReceiveWindow(quicConfig)
+	}
 	if quicParams.MaxIdleTimeout == 0 {
 		quicConfig.MaxIdleTimeout = 30 * time.Second
 	}
@@ -148,7 +155,7 @@ func (c *client) dial(ctx context.Context) error {
 
 	tr := &quic.Transport{Conn: pktConn, DisableGSO: quicParams.DisableGSO}
 
-	if !quicParams.DisableChromeParrot {
+	if quicConfig.ChromeParrot {
 		tr.ConnectionIDGenerator = quic.ZeroLengthConnectionIDGenerator{}
 		c.tlsConfig.GetCertificate = nil
 	}

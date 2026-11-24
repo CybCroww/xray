@@ -35,6 +35,10 @@ closing the flow cancels the requests. XHTTP keeps the configured uplink
 method, session/payload placement, authentication, host and path. The smaller
 packet sizes reduce the maximum transfer rate at a given request interval, so
 measure throughput in addition to memory before changing these defaults.
+The mobile build uses smaller receive windows for gRPC, Hysteria and HTTP/3.
+For QUIC clients it uses standard transport parameters so that the Chrome
+preset cannot override these windows. The smaller windows can constrain peak
+throughput on high-latency links.
 
 `takeMemorySnapshot:` reports the iOS process footprint, available process
 memory, Go memory, packet drops, network changes, and logical XHTTP upload
