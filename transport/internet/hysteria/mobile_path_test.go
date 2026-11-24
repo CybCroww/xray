@@ -209,6 +209,10 @@ func TestMobileHysteriaPathResetCancelsAuthentication(t *testing.T) {
 	if users != 1 || timed {
 		t.Fatal("closing TCP armed the timer while UDP still used the connection")
 	}
+	m.trimIdleClients()
+	if err := activeQUIC.Context().Err(); err != nil {
+		t.Fatalf("memory pressure closed an active UDP session: %v", err)
+	}
 	udp.Close()
 	idle.mu.Lock()
 	users, timed = idle.users, idle.timer != nil
@@ -216,7 +220,7 @@ func TestMobileHysteriaPathResetCancelsAuthentication(t *testing.T) {
 	if users != 0 || !timed {
 		t.Fatal("closing the last UDP session did not arm the timer")
 	}
-	activeQUIC.CloseWithError(closeErrCodeOK, "")
+	m.trimIdleClients()
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 	for {

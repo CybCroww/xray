@@ -65,12 +65,16 @@ func (i *mobileQUICIdle) cancelTimer() {
 // TrimIdleClients releases warm mobile sockets on memory pressure. Busy
 // clients, including pending authentication, are left to their current owner.
 func TrimIdleClients() {
-	mobileManager.RLock()
-	clients := make([]*client, 0, len(mobileManager.m))
-	for _, c := range mobileManager.m {
+	mobileManager.trimIdleClients()
+}
+
+func (m *clientManager) trimIdleClients() {
+	m.RLock()
+	clients := make([]*client, 0, len(m.m))
+	for _, c := range m.m {
 		clients = append(clients, c)
 	}
-	mobileManager.RUnlock()
+	m.RUnlock()
 	for _, c := range clients {
 		select {
 		case c.lock <- struct{}{}:
