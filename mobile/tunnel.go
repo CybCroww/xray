@@ -253,6 +253,7 @@ func (t *Tunnel) TrimMemory(critical bool) {
 	}
 	splithttp.TrimIdleClients()
 	grpctransport.TrimIdleClients()
+	hysteriatransport.TrimIdleClients()
 	if critical {
 		now := time.Now().UnixNano()
 		previous := t.lastTrim.Load()

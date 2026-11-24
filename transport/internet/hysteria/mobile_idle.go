@@ -62,6 +62,32 @@ func (i *mobileQUICIdle) cancelTimer() {
 	}
 }
 
+// TrimIdleClients releases warm mobile sockets on memory pressure. Busy
+// clients, including pending authentication, are left to their current owner.
+func TrimIdleClients() {
+	mobileManager.RLock()
+	clients := make([]*client, 0, len(mobileManager.m))
+	for _, c := range mobileManager.m {
+		clients = append(clients, c)
+	}
+	mobileManager.RUnlock()
+	for _, c := range clients {
+		select {
+		case c.lock <- struct{}{}:
+			if idle := c.mobileIdle; idle != nil {
+				idle.mu.Lock()
+				unused := idle.users == 0
+				idle.mu.Unlock()
+				if unused {
+					c.close(false)
+				}
+			}
+			c.unlock()
+		default:
+		}
+	}
+}
+
 // watchMobileConnection runs under the client lock. Both callbacks verify
 // ownership in case a new authenticated connection replaced the old one.
 func (c *client) watchMobileConnection(conn *quic.Conn) {
