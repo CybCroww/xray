@@ -42,6 +42,7 @@ type dialerConf struct {
 var (
 	globalDialerMap    map[dialerConf]*XmuxManager
 	globalDialerAccess sync.Mutex
+	desktopPoolCleanup sync.Once
 )
 
 func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig, path context.Context) (DialerClient, *XmuxClient, error) {
@@ -76,10 +77,14 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 		})
 		if mobile {
 			xmuxManager.maxPool = 2
+			xmuxManager.onIdle = func() { scheduleIdlePoolCleanup(key, xmuxManager) }
+		} else {
+			desktopPoolCleanup.Do(func() { go reapDesktopPools() })
 		}
 		globalDialerMap[key] = xmuxManager
 	}
 
+	xmuxManager.stopIdleTimer()
 	xmuxClient := xmuxManager.GetXmuxClient(ctx)
 	xmuxClient.AddRunning()
 	return xmuxClient.XmuxConn.(DialerClient), xmuxClient, nil
@@ -360,32 +365,6 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 func init() {
 	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		for range ticker.C {
-			globalDialerAccess.Lock()
-			for key, manager := range globalDialerMap {
-				if (key.mobile && manager.idleFor(45*time.Second)) || !manager.HasActiveClients() {
-					delete(globalDialerMap, key)
-					manager.retire()
-				}
-			}
-			globalDialerAccess.Unlock()
-		}
-	}()
-}
-
-// TrimIdleClients drops mobile connection pools that have no users. Active
-// streams keep running when a Packet Tunnel receives a memory-pressure event.
-func TrimIdleClients() {
-	globalDialerAccess.Lock()
-	defer globalDialerAccess.Unlock()
-	for key, manager := range globalDialerMap {
-		if key.mobile && manager.idleFor(0) {
-			delete(globalDialerMap, key)
-			manager.retire()
-		}
-	}
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {

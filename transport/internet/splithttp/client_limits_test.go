@@ -27,6 +27,57 @@ type streamRoundTripper func(*http.Request) (*http.Response, error)
 
 func (f streamRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+func TestMobilePoolExpiresOnlyAfterLastLease(t *testing.T) {
+	limits := newClientLimits(2, 2)
+	defer resetClientNetwork(limits)
+	path := limits.path.current()
+	settings := &internet.MemoryStreamConfig{ProtocolSettings: &Config{
+		Xmux: &XmuxConfig{MaxConnections: &RangeConfig{From: 2, To: 2}},
+	}}
+	key := dialerConf{Destination: net.TCPDestination(net.LocalHostIP, 443), MemoryStreamConfig: settings, mobile: true, path: path}
+	lease := func(t *testing.T) *XmuxClient {
+		t.Helper()
+		_, client, err := getHTTPClient(context.Background(), key.Destination, settings, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client
+	}
+	// Creating the clients can start the shared logger. Only test the pool
+	// clocks inside the synctest bubble.
+	first, last := lease(t), lease(t)
+	if first == last {
+		t.Fatal("expected two clients in the pool")
+	}
+	synctest.Test(t, func(t *testing.T) {
+		assertState := func(retained, expires bool) {
+			t.Helper()
+			globalDialerAccess.Lock()
+			defer globalDialerAccess.Unlock()
+			manager := globalDialerMap[key]
+			if (manager != nil) != retained || (manager != nil && manager.idleTimer != nil) != expires {
+				t.Fatalf("pool retained = %t, timer pending = %t", manager != nil, manager != nil && manager.idleTimer != nil)
+			}
+		}
+		first.DoneRunning()
+		assertState(true, false)
+		last.DoneRunning()
+		assertState(true, true)
+		time.Sleep(mobilePoolIdleTimeout - time.Second)
+		active := lease(t)
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		assertState(true, false)
+		active.DoneRunning()
+		time.Sleep(mobilePoolIdleTimeout)
+		synctest.Wait()
+		assertState(false, false)
+		if !first.closed.Load() || !last.closed.Load() {
+			t.Fatal("expired clients did not close")
+		}
+	})
+}
+
 func TestMobileUploadRetainsBodyThroughRetry(t *testing.T) {
 	for _, cancelled := range []bool{false, true} {
 		name := "response before body close"

@@ -22,7 +22,7 @@ type XmuxClient struct {
 	LeftRequests atomic.Int32
 	UnreusableAt time.Time
 	NotUsed      atomic.Bool
-	idleAt       atomic.Int64
+	onIdle       func()
 	closed       atomic.Bool
 }
 
@@ -31,10 +31,11 @@ func (c *XmuxClient) AddRunning() {
 }
 
 func (c *XmuxClient) DoneRunning() {
-	if c.Running.Add(-1) == 0 {
-		c.idleAt.Store(time.Now().UnixNano())
-	}
+	idle := c.Running.Add(-1) == 0
 	c.maybeClose()
+	if idle && c.onIdle != nil && !c.NotUsed.Load() {
+		c.onIdle()
+	}
 }
 
 // close the XmuxConn if it is not used and has no running requests
@@ -44,10 +45,9 @@ func (c *XmuxClient) maybeClose() {
 	}
 }
 
-func (m *XmuxManager) idleFor(duration time.Duration) bool {
-	cutoff := time.Now().Add(-duration).UnixNano()
+func (m *XmuxManager) isIdle() bool {
 	for _, client := range m.xmuxClients {
-		if client.Running.Load() > 0 || client.idleAt.Load() > cutoff {
+		if client.Running.Load() > 0 {
 			return false
 		}
 	}
@@ -55,6 +55,7 @@ func (m *XmuxManager) idleFor(duration time.Duration) bool {
 }
 
 func (m *XmuxManager) retire() {
+	m.stopIdleTimer()
 	for _, client := range m.xmuxClients {
 		client.NotUsed.Store(true)
 		client.maybeClose()
@@ -68,6 +69,8 @@ type XmuxManager struct {
 	maxPool     int
 	newConnFunc func() XmuxConn
 	xmuxClients []*XmuxClient
+	onIdle      func()
+	idleTimer   *time.Timer
 }
 
 func NewXmuxManager(xmuxConfig *XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
@@ -96,6 +99,7 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
 	xmuxClient := &XmuxClient{
 		XmuxConn:  m.newConnFunc(),
 		leftUsage: -1,
+		onIdle:    m.onIdle,
 	}
 	if x := m.xmuxConfig.GetNormalizedCMaxReuseTimes().rand(); x > 0 {
 		xmuxClient.leftUsage = x - 1
