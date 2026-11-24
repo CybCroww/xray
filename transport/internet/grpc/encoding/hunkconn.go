@@ -77,6 +77,9 @@ func (h *HunkReaderWriter) Read(buf []byte) (int, error) {
 	}
 	n := copy(buf, h.buf[h.index:])
 	h.index += n
+	if h.index == len(h.buf) {
+		h.buf, h.index = nil, 0
+	}
 
 	return n, nil
 }
@@ -91,15 +94,16 @@ func (h *HunkReaderWriter) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		}
 	}
 
-	if cap(h.buf) >= buf.Size {
+	if h.index == 0 && cap(h.buf) >= buf.Size {
 		b := h.buf
-		h.index = len(h.buf)
+		h.buf = nil
 		return buf.MultiBuffer{buf.NewExisted(b)}, nil
 	}
 
 	b := buf.New()
 	_, err := b.ReadFrom(h)
 	if err != nil {
+		b.Release()
 		return nil, err
 	}
 	return buf.MultiBuffer{b}, nil
@@ -119,7 +123,9 @@ func (h *HunkReaderWriter) Write(buf []byte) (int, error) {
 
 func (h *HunkReaderWriter) Close() error {
 	if h.cancel != nil {
+		// Cancellation also unblocks Recv and may race safely with Send.
 		h.cancel()
+		return h.done.Close()
 	}
 	if sc, match := h.hc.(StreamCloser); match {
 		return sc.CloseSend()

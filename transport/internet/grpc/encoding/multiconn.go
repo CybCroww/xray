@@ -23,12 +23,10 @@ type MultiHunkReaderWriter struct {
 	hc     MultiHunkConn
 	cancel context.CancelFunc
 	done   *done.Instance
-
-	buf [][]byte
 }
 
 func NewMultiHunkReadWriter(hc MultiHunkConn, cancel context.CancelFunc) *MultiHunkReaderWriter {
-	return &MultiHunkReaderWriter{hc, cancel, done.New(), nil}
+	return &MultiHunkReaderWriter{hc, cancel, done.New()}
 }
 
 func NewMultiHunkConn(hc MultiHunkConn, cancel context.CancelFunc, trustedXForwardedFor []string) net.Conn {
@@ -44,32 +42,21 @@ func NewMultiHunkConn(hc MultiHunkConn, cancel context.CancelFunc, trustedXForwa
 	)
 }
 
-func (h *MultiHunkReaderWriter) forceFetch() error {
-	hunk, err := h.hc.Recv()
-	if err != nil {
-		if err == io.EOF {
-			return err
-		}
-
-		return errors.New("failed to fetch hunk from gRPC tunnel").Base(err)
-	}
-
-	h.buf = hunk.Data
-
-	return nil
-}
-
 func (h *MultiHunkReaderWriter) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if h.done.Done() {
 		return nil, io.EOF
 	}
+	hunk, err := h.hc.Recv()
+	if err != nil {
+		if err == io.EOF {
+			return nil, err
+		}
 
-	if err := h.forceFetch(); err != nil {
-		return nil, err
+		return nil, errors.New("failed to fetch hunk from gRPC tunnel").Base(err)
 	}
 
-	mb := make(buf.MultiBuffer, 0, len(h.buf))
-	for _, b := range h.buf {
+	mb := make(buf.MultiBuffer, 0, len(hunk.Data))
+	for _, b := range hunk.Data {
 		if len(b) == 0 {
 			continue
 		}
@@ -112,6 +99,7 @@ func (h *MultiHunkReaderWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 func (h *MultiHunkReaderWriter) Close() error {
 	if h.cancel != nil {
 		h.cancel()
+		return h.done.Close()
 	}
 	if sc, match := h.hc.(StreamCloser); match {
 		return sc.CloseSend()
