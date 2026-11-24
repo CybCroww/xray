@@ -79,12 +79,14 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 	streamCtx, cancel := context.WithCancel(ctx)
 	if grpcSettings.MultiMode {
 		errors.LogDebug(ctx, "using gRPC multi mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunMultiStreamName()+"`")
-		grpcService, err := client.(encoding.GRPCServiceClientX).TunMultiCustomName(streamCtx, grpcSettings.getServiceName(), grpcSettings.getTunMultiStreamName())
+		mobile := runtime.GOOS == "ios" || runtime.GOOS == "android"
+		conn, err := encoding.OpenMultiHunkConn(streamCtx, cancel, client.(encoding.GRPCServiceClientX),
+			grpcSettings.getServiceName(), grpcSettings.getTunMultiStreamName(), mobile)
 		if err != nil {
 			cancel()
 			return nil, errors.New("Cannot dial gRPC").Base(err)
 		}
-		return encoding.NewMultiHunkConn(grpcService, cancel, nil), nil
+		return conn, nil
 	}
 
 	errors.LogDebug(ctx, "using gRPC tun mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunStreamName()+"`")

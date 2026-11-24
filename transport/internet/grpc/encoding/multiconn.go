@@ -9,6 +9,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/common/signal/done"
+	"google.golang.org/grpc"
 )
 
 type MultiHunkConn interface {
@@ -20,31 +21,58 @@ type MultiHunkConn interface {
 }
 
 type MultiHunkReaderWriter struct {
-	hc     MultiHunkConn
-	cancel context.CancelFunc
-	done   *done.Instance
+	hc      MultiHunkConn
+	cancel  context.CancelFunc
+	done    *done.Instance
+	compact bool
 }
 
 func NewMultiHunkReadWriter(hc MultiHunkConn, cancel context.CancelFunc) *MultiHunkReaderWriter {
-	return &MultiHunkReaderWriter{hc, cancel, done.New()}
+	return &MultiHunkReaderWriter{hc: hc, cancel: cancel, done: done.New()}
 }
 
 func NewMultiHunkConn(hc MultiHunkConn, cancel context.CancelFunc, trustedXForwardedFor []string) net.Conn {
-	rAddr := remoteAddrFromContext(hc.Context(), trustedXForwardedFor)
-	lAddr := localAddrFromContext(hc.Context())
-	wrc := NewMultiHunkReadWriter(hc, cancel)
+	return newMultiHunkConn(NewMultiHunkReadWriter(hc, cancel), trustedXForwardedFor)
+}
+
+// OpenMultiHunkConn opens the client stream and optionally reassembles inbound
+// protobuf fields directly into Xray buffers.
+func OpenMultiHunkConn(ctx context.Context, cancel context.CancelFunc, client GRPCServiceClientX, service, method string, compact bool) (net.Conn, error) {
+	var options []grpc.CallOption
+	if compact {
+		options = append(options, grpc.ForceCodecV2(compactMultiHunkCodec))
+	}
+	stream, err := client.TunMultiCustomName(ctx, service, method, options...)
+	if err != nil {
+		return nil, err
+	}
+	wrc := NewMultiHunkReadWriter(stream, cancel)
+	wrc.compact = compact
+	return newMultiHunkConn(wrc, nil), nil
+}
+
+func newMultiHunkConn(wrc *MultiHunkReaderWriter, trustedXForwardedFor []string) net.Conn {
+	ctx := wrc.hc.Context()
 	return cnc.NewConnection(
 		cnc.ConnectionInputMulti(wrc),
 		cnc.ConnectionOutputMulti(wrc),
 		cnc.ConnectionOnClose(wrc),
-		cnc.ConnectionRemoteAddr(rAddr),
-		cnc.ConnectionLocalAddr(lAddr),
+		cnc.ConnectionRemoteAddr(remoteAddrFromContext(ctx, trustedXForwardedFor)),
+		cnc.ConnectionLocalAddr(localAddrFromContext(ctx)),
 	)
 }
 
 func (h *MultiHunkReaderWriter) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if h.done.Done() {
 		return nil, io.EOF
+	}
+	if h.compact {
+		var chunk mobileMultiHunk
+		if err := h.hc.RecvMsg(&chunk); err != nil {
+			buf.ReleaseMulti(chunk.payload)
+			return nil, err
+		}
+		return chunk.payload, nil
 	}
 	hunk, err := h.hc.Recv()
 	if err != nil {

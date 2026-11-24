@@ -47,6 +47,9 @@ method, session/payload placement, authentication, host and path. The smaller
 packet sizes reduce the maximum transfer rate at a given request interval, so
 measure throughput in addition to memory before changing these defaults.
 The mobile build uses smaller receive windows for gRPC, Hysteria and HTTP/3.
+In gRPC multi-mode the decoder assembles protobuf fields into reusable 8 KiB
+buffers so small writes can share storage and large reads can release it in
+parts. The same gRPC servers and stream format work with this decoder.
 For QUIC clients it uses standard transport parameters so that the Chrome
 preset cannot override these windows. The smaller windows can constrain peak
 throughput on high-latency links.

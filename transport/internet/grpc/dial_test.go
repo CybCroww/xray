@@ -3,10 +3,12 @@ package grpc
 import (
 	"bytes"
 	"context"
+	"io"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/grpc/encoding"
@@ -81,6 +83,77 @@ func TestMobileGRPCReceivesMessageLargerThanWindow(t *testing.T) {
 	if !bytes.Equal(reply.Data, payload) {
 		t.Fatalf("received %d bytes, expected %d", len(reply.Data), len(payload))
 	}
+}
+
+type fragmentedMultiHunkServer struct {
+	encoding.UnimplementedGRPCServiceServer
+	fragments [][]byte
+}
+
+func (s fragmentedMultiHunkServer) TunMulti(stream encoding.GRPCService_TunMultiServer) error {
+	request, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	return stream.Send(&encoding.MultiHunk{Data: append(request.Data, s.fragments...)})
+}
+
+func TestMobileGRPCCompactsMultiHunk(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	fragments := make([][]byte, 0, 1026)
+	for i := range 1024 {
+		fragments = append(fragments, bytes.Repeat([]byte{byte(i)}, 96))
+	}
+	fragments = append(fragments, nil, bytes.Repeat([]byte{0x2f}, 768<<10))
+	server := grpc.NewServer()
+	defer server.Stop()
+	settings := &Config{MultiMode: true}
+	encoding.RegisterGRPCServiceServerX(server, fragmentedMultiHunkServer{fragments: fragments},
+		settings.getServiceName(), settings.getTunStreamName(), settings.getTunMultiStreamName())
+	go server.Serve(listener)
+	options := appendReceiveWindowOptions([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, 0, true)
+	channel, err := grpc.NewClient("passthrough:///"+listener.Addr().String(), options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer channel.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := encoding.NewGRPCServiceClient(channel).(encoding.GRPCServiceClientX)
+	conn, err := encoding.OpenMultiHunkConn(ctx, cancel, client, settings.getServiceName(), settings.getTunMultiStreamName(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "echo"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := conn.(buf.Reader).ReadMultiBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buf.ReleaseMulti(data)
+	want := append([]byte("echo"), bytes.Join(fragments, nil)...)
+	got := make([]byte, data.Len())
+	data.Copy(got)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("byte stream changed: received %d bytes, want %d", len(got), len(want))
+	}
+	var capacity int
+	for _, block := range data {
+		capacity += int(block.Cap())
+		if block.Cap() != buf.Size {
+			t.Fatalf("read retained a block larger than the release unit: %d", block.Cap())
+		}
+	}
+	if capacity > len(want)+buf.Size-1 {
+		t.Fatalf("retained %d bytes of buffer backing for %d bytes of payload", capacity, len(want))
+	}
+	t.Logf("%d bytes of buffer backing for %d bytes of payload", capacity, len(want))
 }
 
 type silentTunnelServer struct {
