@@ -3,10 +3,13 @@ package splithttp
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,5 +108,86 @@ func TestMobilePacketUploadsBackpressureAndCancel(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatal("write stayed blocked after closing the tunnel")
 		}
+	}
+}
+
+func TestMobilePacketUploadKeepsHeaderTransport(t *testing.T) {
+	type field struct {
+		sequence int
+		data     []byte
+	}
+	fields := make(chan field, 32)
+	shutdown := make(chan struct{})
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Seq") == "" {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+			case <-shutdown:
+			}
+			return
+		}
+		sequence, seqErr := strconv.Atoi(r.Header.Get("X-Seq"))
+		data, decodeErr := base64.RawURLEncoding.DecodeString(collectIndexedHeaderValues(r.Header, "X-Payload-"))
+		if seqErr != nil || decodeErr != nil || r.Method != http.MethodGet || r.Header.Get("X-Session-Id") == "" || len(data) == 0 || len(data) > 4<<10 {
+			t.Errorf("unexpected header upload: method=%s size=%d", r.Method, len(data))
+		}
+		fields <- field{sequence, data}
+		w.WriteHeader(http.StatusOK)
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+	defer close(shutdown)
+	destination, err := net.ParseDestination("tcp:" + strings.TrimPrefix(server.URL, "https://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := &internet.MemoryStreamConfig{
+		ProtocolName: "splithttp", SecurityType: "tls",
+		ProtocolSettings: &Config{
+			Path: "/test", Mode: "packet-up", UplinkHTTPMethod: "GET", UplinkDataPlacement: PlacementHeader,
+			UplinkDataKey: "X-Payload", SessionIDPlacement: PlacementHeader, SessionIDKey: "X-Session-Id",
+			SeqPlacement: PlacementHeader, UplinkChunkSize: &RangeConfig{From: 2048, To: 2048},
+		},
+		SecuritySettings: &tls.Config{PinnedPeerCertSha256: [][]byte{tls.GenerateCertHash(server.Certificate().Raw)}},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := dial(ctx, destination, settings, &clientLimits{flows: make(chan struct{}, 1), packets: make(chan struct{}, 4)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	want := make([]byte, 10000)
+	for i := range want {
+		want[i] = byte((i / 313) % 251)
+	}
+	result := make(chan error, 1)
+	go func() { _, err := conn.Write(want); result <- err }()
+	parts := make(map[int][]byte)
+	received := 0
+	for received < len(want) {
+		select {
+		case packet := <-fields:
+			if _, ok := parts[packet.sequence]; ok {
+				t.Fatalf("duplicate packet %d", packet.sequence)
+			}
+			parts[packet.sequence] = packet.data
+			received += len(packet.data)
+		case <-ctx.Done():
+			t.Fatalf("received %d of %d bytes", received, len(want))
+		}
+	}
+	var got []byte
+	for i := range len(parts) {
+		got = append(got, parts[i]...)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("header payload changed")
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
 	}
 }
