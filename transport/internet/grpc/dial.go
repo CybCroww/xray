@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"reflect"
+	"runtime"
 	"sync"
 	"time"
 
@@ -47,6 +48,25 @@ var (
 	globalDialerMap    map[dialerConf]*grpc.ClientConn
 	globalDialerAccess sync.Mutex
 )
+
+// ResetMobileNetwork closes cached channels from the previous device path.
+// Keep channel shutdown outside the pool lock so dialing can resume promptly.
+func ResetMobileNetwork() {
+	if runtime.GOOS != "ios" && runtime.GOOS != "android" {
+		return
+	}
+	resetCachedChannels()
+}
+
+func resetCachedChannels() {
+	globalDialerAccess.Lock()
+	old := globalDialerMap
+	globalDialerMap = nil
+	globalDialerAccess.Unlock()
+	for _, conn := range old {
+		conn.Close()
+	}
+}
 
 func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
@@ -196,8 +216,8 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		}
 		setUserAgent(conn, userAgent)
 		conn.Connect()
+		globalDialerMap[dialerConf{dest, streamSettings}] = conn
 	}
-	globalDialerMap[dialerConf{dest, streamSettings}] = conn
 	return conn, err
 }
 

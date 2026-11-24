@@ -83,8 +83,12 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 // returns and lets go of its outbound. Called when the stack closes; without it an inbound's UDP flows,
 // and whatever carries them, outlive the instance.
 func (u *udpConnectionHandler) closeAll() {
+	u.reset(true)
+}
+
+func (u *udpConnectionHandler) reset(closing bool) {
 	u.Lock()
-	u.closed = true
+	u.closed = u.closed || closing
 	conns := make([]*udpConn, 0, len(u.udpConns))
 	for _, c := range u.udpConns {
 		conns = append(conns, c)
@@ -92,8 +96,21 @@ func (u *udpConnectionHandler) closeAll() {
 	u.udpConns = make(map[net.Destination]*udpConn)
 	u.Unlock()
 	for _, c := range conns {
-		c.queue.close()
+		c.queue.discard()
 	}
+}
+
+func (q *packetQueue) discard() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.closed {
+		q.closed = true
+		close(q.notify)
+	}
+	for _, packet := range q.items {
+		packet.Release()
+	}
+	q.items = nil
 }
 
 func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {

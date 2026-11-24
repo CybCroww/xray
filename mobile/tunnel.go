@@ -19,6 +19,8 @@ import (
 	"github.com/xtls/xray-core/infra/conf/serial"
 	_ "github.com/xtls/xray-core/main/distro/all"
 	"github.com/xtls/xray-core/proxy/tun"
+	grpctransport "github.com/xtls/xray-core/transport/internet/grpc"
+	hysteriatransport "github.com/xtls/xray-core/transport/internet/hysteria"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
 )
 
@@ -34,19 +36,34 @@ var owner struct {
 }
 
 type Tunnel struct {
-	instance *core.Instance
-	device   *packetDevice
-	cancel   context.CancelFunc
-	oldLimit int64
-	limit    int64
-	lastTrim atomic.Int64
-	stopped  atomic.Bool
+	instance      *core.Instance
+	device        *packetDevice
+	cancel        context.CancelFunc
+	oldLimit      int64
+	limit         int64
+	xhttpRequests uint64
+	xhttpBytes    uint64
+	xhttpFailures uint64
+	lastTrim      atomic.Int64
+	stopped       atomic.Bool
+	resetFlows    func()
+	pathChanges   atomic.Uint64
 }
 
 // Start attaches the core to a packet flow whose network settings are already
 // configured by the app. The JSON must contain one TUN inbound. A zero memory
 // limit selects the platform default. The limit is a Go runtime soft target.
 func Start(configJSON string, writer PacketWriter, mtu, memoryLimitMiB int) (*Tunnel, error) {
+	return start(configJSON, writer, mtu, memoryLimitMiB, false)
+}
+
+// StartProtected starts the full-tunnel profile. The host must also enable
+// includeAllNetworks and install default IPv4 and IPv6 routes.
+func StartProtected(configJSON string, writer PacketWriter, mtu, memoryLimitMiB int) (*Tunnel, error) {
+	return start(configJSON, writer, mtu, memoryLimitMiB, true)
+}
+
+func start(configJSON string, writer PacketWriter, mtu, memoryLimitMiB int, protected bool) (*Tunnel, error) {
 	if writer == nil || mtu < 1280 || mtu > 1500 {
 		return nil, errors.New("packet writer and an MTU between 1280 and 1500 are required")
 	}
@@ -65,23 +82,30 @@ func Start(configJSON string, writer PacketWriter, mtu, memoryLimitMiB int) (*Tu
 		return nil, errors.New("a mobile tunnel is already running")
 	}
 	device := newPacketDevice(writer, mtu)
-	ctx, cancel := context.WithCancel(tun.ContextWithDevice(context.Background(), device))
+	var resetFlows func()
+	ctx := tun.ContextWithDevice(context.Background(), device)
+	ctx = tun.ContextWithFlowReset(ctx, func(reset func()) { resetFlows = reset })
+	ctx, cancel := context.WithCancel(ctx)
 	oldLimit := debug.SetMemoryLimit(-1)
 	limit := min(oldLimit, int64(memoryLimitMiB)<<20)
 	debug.SetMemoryLimit(limit)
-	instance, err := startInstance(ctx, configJSON, mtu)
+	requests, bytes, failures := splithttp.MobileUploadStats()
+	instance, err := startInstance(ctx, configJSON, mtu, protected)
 	if err != nil {
 		cancel()
 		device.Close()
 		debug.SetMemoryLimit(oldLimit)
 		return nil, err
 	}
-	tunnel := &Tunnel{instance: instance, device: device, cancel: cancel, oldLimit: oldLimit, limit: limit}
+	tunnel := &Tunnel{
+		instance: instance, device: device, cancel: cancel, oldLimit: oldLimit, limit: limit,
+		xhttpRequests: requests, xhttpBytes: bytes, xhttpFailures: failures, resetFlows: resetFlows,
+	}
 	owner.tunnel = tunnel
 	return tunnel, nil
 }
 
-func startInstance(ctx context.Context, configJSON string, mtu int) (*core.Instance, error) {
+func startInstance(ctx context.Context, configJSON string, mtu int, protected bool) (*core.Instance, error) {
 	if len(configJSON) > 512<<10 || !json.Valid([]byte(configJSON)) {
 		return nil, errors.New("invalid or oversized mobile JSON configuration")
 	}
@@ -91,6 +115,11 @@ func startInstance(ctx context.Context, configJSON string, mtu int) (*core.Insta
 	}
 	if len(cfg.Env) != 0 || len(cfg.InboundConfigs) != 1 || !strings.EqualFold(cfg.InboundConfigs[0].Protocol, "tun") {
 		return nil, errors.New("mobile configuration requires exactly one TUN inbound without environment overrides")
+	}
+	if protected {
+		if err := protectProfile(cfg); err != nil {
+			return nil, err
+		}
 	}
 	inbound := &cfg.InboundConfigs[0]
 	tunConfig := conf.TunConfig{}
@@ -147,6 +176,25 @@ func startInstance(ctx context.Context, configJSON string, mtu int) (*core.Insta
 // native read callback. false means that the packet was dropped.
 func (t *Tunnel) PushPacket(packet []byte) bool { return t.device.push(packet) }
 
+// NetworkChanged resets app flows without removing the native VPN routes.
+// It sends no probes and does not change the selected VPN endpoint.
+func (t *Tunnel) NetworkChanged() {
+	owner.Lock()
+	defer owner.Unlock()
+	if owner.tunnel != t || t.resetFlows == nil {
+		return
+	}
+	t.pathChanges.Add(1)
+	resetTransportPaths()
+	t.resetFlows()
+}
+
+func resetTransportPaths() {
+	splithttp.ResetMobileNetwork()
+	grpctransport.ResetMobileNetwork()
+	hysteriatransport.ResetMobileNetwork()
+}
+
 // Stop releases the extension's tunnel and is safe to call more than once.
 func (t *Tunnel) Stop() error {
 	owner.Lock()
@@ -156,9 +204,11 @@ func (t *Tunnel) Stop() error {
 	}
 	t.stopped.Store(true)
 	t.cancel()
+	resetTransportPaths()
 	err := t.instance.Close()
 	t.device.Close()
 	t.instance = nil
+	t.resetFlows = nil
 	splithttp.TrimIdleClients()
 	debug.SetMemoryLimit(t.oldLimit)
 	owner.tunnel = nil
@@ -192,7 +242,9 @@ func (t *Tunnel) MemoryStatsJSON() string {
 		{Name: "/sched/goroutines:goroutines"},
 	}
 	metrics.Read(s[:])
-	return fmt.Sprintf(`{"goManagedBytes":%d,"goHeapBytes":%d,"goTargetBytes":%d,"goroutines":%d,"queuedPackets":%d,"droppedInputPackets":%d,"droppedOutputPackets":%d}`,
+	requests, bytes, failures := splithttp.MobileUploadStats()
+	return fmt.Sprintf(`{"goManagedBytes":%d,"goHeapBytes":%d,"goTargetBytes":%d,"goroutines":%d,"queuedPackets":%d,"droppedInputPackets":%d,"droppedOutputPackets":%d,"xhttpUploadRequests":%d,"xhttpUploadPayloadBytes":%d,"xhttpUploadFailures":%d,"networkChanges":%d}`,
 		s[0].Value.Uint64()-s[1].Value.Uint64(), s[2].Value.Uint64(), t.limit, s[3].Value.Uint64(),
-		t.device.queued(), t.device.inputDrops.Load(), t.device.outputDrops.Load())
+		t.device.queued(), t.device.inputDrops.Load(), t.device.outputDrops.Load(),
+		requests-t.xhttpRequests, bytes-t.xhttpBytes, failures-t.xhttpFailures, t.pathChanges.Load())
 }

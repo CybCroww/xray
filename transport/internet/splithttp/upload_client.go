@@ -5,6 +5,7 @@ import (
 	"net/http/httptrace"
 	"runtime"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -17,6 +18,22 @@ import (
 type clientLimits struct {
 	flows   chan struct{}
 	packets chan struct{}
+	stats   uploadCounters
+	path    clientPath
+}
+
+type uploadCounters struct {
+	requests atomic.Uint64
+	bytes    atomic.Uint64
+	failures atomic.Uint64
+}
+
+// MobileUploadStats returns process-wide logical packet upload requests,
+// payload bytes and failed requests. It does not count response headers, TLS
+// overhead or retransmits. It does not start any network traffic.
+func MobileUploadStats() (requests, bytes, failures uint64) {
+	stats := &mobileLimits.stats
+	return stats.requests.Load(), stats.bytes.Load(), stats.failures.Load()
 }
 
 var mobileLimits = &clientLimits{flows: make(chan struct{}, 64), packets: make(chan struct{}, 24)}
@@ -94,8 +111,18 @@ func uploadPackets(ctx context.Context, cancel context.CancelFunc, reader *pipe.
 			<-local
 			return
 		}
+		if limits != nil && remainder.Len() < size {
+			// Read once after waiting for both the configured interval and a
+			// request slot. This batches new writes without any extra latency or
+			// timer, and pulling once preserves the upload queue's memory bound.
+			remainder, _ = buf.MergeMulti(remainder, reader.TryReadMultiBuffer())
+		}
 		var chunk buf.MultiBuffer
 		remainder, chunk = buf.SplitSize(remainder, size)
+		if limits != nil {
+			limits.stats.requests.Add(1)
+			limits.stats.bytes.Add(uint64(chunk.Len()))
+		}
 		wrote := make(chan struct{}, 1)
 		signalWritten := func() {
 			select {
@@ -107,6 +134,14 @@ func uploadPackets(ctx context.Context, cancel context.CancelFunc, reader *pipe.
 		seqStr := strconv.FormatInt(seq, 10)
 		seq++
 		client, releaseClient := selectClient(ctx)
+		if client == nil {
+			buf.ReleaseMulti(chunk)
+			<-local
+			if limits != nil {
+				<-limits.packets
+			}
+			return
+		}
 		go func() {
 			defer func() {
 				<-local
@@ -125,9 +160,14 @@ func uploadPackets(ctx context.Context, cancel context.CancelFunc, reader *pipe.
 					}
 				},
 			})
-			if err := client.PostPacket(requestCtx, requestURI, sessionID, seqStr, chunk); err != nil && ctx.Err() == nil {
-				errors.LogInfoInner(ctx, err, "failed to send upload")
-				cancel()
+			if err := client.PostPacket(requestCtx, requestURI, sessionID, seqStr, chunk); err != nil {
+				if ctx.Err() == nil {
+					if limits != nil {
+						limits.stats.failures.Add(1)
+					}
+					errors.LogInfoInner(ctx, err, "failed to send upload")
+					cancel()
+				}
 			}
 		}()
 		// Start requests in transport write order. HTTP/2 and HTTP/3 can then

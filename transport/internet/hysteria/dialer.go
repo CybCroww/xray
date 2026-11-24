@@ -60,8 +60,8 @@ func (c *client) status() status {
 
 func (c *client) close() {
 	c.conn.CloseWithError(closeErrCodeOK, "")
-	c.tr.Close()
 	c.pktConn.Close()
+	c.tr.Close()
 	c.conn = nil
 	c.tr = nil
 	c.pktConn = nil
@@ -341,7 +341,9 @@ func (m *clientManager) clean() {
 			c.clean(force)
 			if force {
 				m.Lock()
-				delete(m.m, k)
+				if m.m[k] == c {
+					delete(m.m, k)
+				}
 				m.Unlock()
 			}
 		}
@@ -349,9 +351,28 @@ func (m *clientManager) clean() {
 }
 
 var (
-	manager     *clientManager
+	manager     = &clientManager{m: make(map[dialerConf]*client)}
 	initmanager sync.Once
 )
+
+// ResetMobileNetwork detaches previous-path clients immediately. Cleanup of
+// their QUIC sessions can wait for I/O without blocking fresh dials.
+func ResetMobileNetwork() {
+	if runtime.GOOS != "ios" && runtime.GOOS != "android" {
+		return
+	}
+	manager.Lock()
+	old := manager.m
+	manager.m = make(map[dialerConf]*client)
+	manager.Unlock()
+	if len(old) != 0 {
+		go func() {
+			for _, c := range old {
+				c.clean(true)
+			}
+		}()
+	}
+}
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
@@ -363,9 +384,6 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	dest.Network = net.Network_UDP
 
 	initmanager.Do(func() {
-		manager = &clientManager{
-			m: make(map[dialerConf]*client),
-		}
 		go manager.clean()
 	})
 

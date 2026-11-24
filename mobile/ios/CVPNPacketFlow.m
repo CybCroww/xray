@@ -1,8 +1,42 @@
 #import "CVPNPacketFlow.h"
 #import <CVPNCore/CVPNCore.h>
+#import <Network/Network.h>
+#import <arpa/inet.h>
 #import <mach/mach.h>
 #import <os/proc.h>
 #import <sys/socket.h>
+
+void CVPNRequireProtectedRouting(NETunnelProviderProtocol *configuration) {
+    configuration.includeAllNetworks = YES;
+    configuration.excludeLocalNetworks = NO;
+    if (@available(iOS 16.4, *)) {
+        configuration.excludeAPNs = NO;
+        configuration.excludeCellularServices = NO;
+    }
+    if (@available(iOS 17.4, *)) configuration.excludeDeviceCommunication = NO;
+}
+
+NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resolverIPs, NSInteger mtu) {
+    if (mtu < 1280 || mtu > 1500 || resolverIPs.count == 0) return nil;
+    for (NSString *resolver in resolverIPs) {
+        struct in_addr v4;
+        struct in6_addr v6;
+        const char *address = resolver.UTF8String;
+        if (!address || (inet_pton(AF_INET, address, &v4) != 1 && inet_pton(AF_INET6, address, &v6) != 1)) return nil;
+    }
+    NEPacketTunnelNetworkSettings *settings = [[NEPacketTunnelNetworkSettings alloc] initWithTunnelRemoteAddress:@"127.0.0.1"];
+    NEIPv4Settings *ipv4 = [[NEIPv4Settings alloc] initWithAddresses:@[@"198.18.0.2"] subnetMasks:@[@"255.255.255.252"]];
+    ipv4.includedRoutes = @[[NEIPv4Route defaultRoute]];
+    settings.IPv4Settings = ipv4;
+    NEIPv6Settings *ipv6 = [[NEIPv6Settings alloc] initWithAddresses:@[@"fd00:6376:706e::2"] networkPrefixLengths:@[@64]];
+    ipv6.includedRoutes = @[[NEIPv6Route defaultRoute]];
+    settings.IPv6Settings = ipv6;
+    NEDNSSettings *dns = [[NEDNSSettings alloc] initWithServers:resolverIPs];
+    dns.matchDomains = @[@""];
+    settings.DNSSettings = dns;
+    settings.MTU = @(mtu);
+    return settings;
+}
 
 @interface CVPNFlowWriter : NSObject <CVPNMobilePacketWriter>
 @property (nonatomic, weak) NEPacketTunnelFlow *flow;
@@ -20,57 +54,108 @@
 @end
 
 @implementation CVPNPacketFlow {
+    __weak NEPacketTunnelProvider *_provider;
     NEPacketTunnelFlow *_flow;
     dispatch_queue_t _queue;
     dispatch_source_t _memoryPressure;
+    nw_path_monitor_t _pathMonitor;
+    nw_path_t _lastPath;
     CVPNMobileTunnel *_tunnel;
     BOOL _readPending;
+    BOOL _starting;
     uint64_t _generation;
 }
 
-- (instancetype)initWithPacketFlow:(NEPacketTunnelFlow *)flow {
+- (instancetype)initWithProvider:(NEPacketTunnelProvider *)provider {
     if ((self = [super init])) {
-        _flow = flow;
+        _provider = provider;
+        _flow = provider.packetFlow;
         _queue = dispatch_queue_create("cvpn.packet-flow", DISPATCH_QUEUE_SERIAL);
     }
     return self;
 }
 
-- (void)startWithConfig:(NSString *)config mtu:(NSInteger)mtu completion:(void (^)(NSError *))completion {
+- (void)startWithConfig:(NSString *)config mtu:(NSInteger)mtu resolverIPs:(NSArray<NSString *> *)resolverIPs completion:(void (^)(NSError *))completion {
     dispatch_async(_queue, ^{
-        if (self->_tunnel) {
+        if (self->_tunnel || self->_starting) {
             completion([NSError errorWithDomain:@"CVPNPacketFlow" code:1 userInfo:nil]);
             return;
         }
-        CVPNFlowWriter *writer = [CVPNFlowWriter new];
-        writer.flow = self->_flow;
-        NSError *error = nil;
-        CVPNMobileTunnel *tunnel = CVPNMobileStart(config, writer, mtu, 0, &error);
-        if (!tunnel) {
-            completion(error ?: [NSError errorWithDomain:@"CVPNPacketFlow" code:2 userInfo:nil]);
+        NEPacketTunnelProvider *provider = self->_provider;
+        NEVPNProtocol *profile = provider.protocolConfiguration;
+        NEPacketTunnelNetworkSettings *settings = CVPNFullTunnelSettings(resolverIPs, mtu);
+        BOOL hasExclusions = profile.excludeLocalNetworks;
+        if (@available(iOS 16.4, *)) hasExclusions = hasExclusions || profile.excludeAPNs || profile.excludeCellularServices;
+        if (@available(iOS 17.4, *)) hasExclusions = hasExclusions || profile.excludeDeviceCommunication;
+        if (!profile.includeAllNetworks || hasExclusions || !settings) {
+            completion([NSError errorWithDomain:@"CVPNPacketFlow" code:3 userInfo:nil]);
             return;
         }
-        self->_tunnel = tunnel;
-        self->_generation++;
-        [self readNext];
-
-        dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
-            DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
-            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-        if (source) {
-            __weak CVPNMobileTunnel *weakTunnel = tunnel;
-            __weak dispatch_source_t weakSource = source;
-            dispatch_source_set_event_handler(source, ^{
-                dispatch_source_t strongSource = weakSource;
-                if (strongSource) {
-                    [weakTunnel trimMemory:(dispatch_source_get_data(strongSource) & DISPATCH_MEMORYPRESSURE_CRITICAL) != 0];
+        self->_starting = YES;
+        uint64_t generation = ++self->_generation;
+        [provider setTunnelNetworkSettings:settings completionHandler:^(NSError *error) {
+            dispatch_async(self->_queue, ^{
+                if (generation != self->_generation) {
+                    completion([NSError errorWithDomain:NSCocoaErrorDomain code:NSUserCancelledError userInfo:nil]);
+                    return;
                 }
+                self->_starting = NO;
+                if (error) { completion(error); return; }
+                [self startCore:config mtu:mtu completion:completion];
             });
-            self->_memoryPressure = source;
-            dispatch_resume(source);
-        }
-        completion(nil);
+        }];
     });
+}
+
+- (void)startCore:(NSString *)config mtu:(NSInteger)mtu completion:(void (^)(NSError *))completion {
+    CVPNFlowWriter *writer = [CVPNFlowWriter new];
+    writer.flow = self->_flow;
+    NSError *error = nil;
+    CVPNMobileTunnel *tunnel = CVPNMobileStartProtected(config, writer, mtu, 0, &error);
+    if (!tunnel) {
+        completion(error ?: [NSError errorWithDomain:@"CVPNPacketFlow" code:2 userInfo:nil]);
+        return;
+    }
+    self->_tunnel = tunnel;
+    [self readNext];
+    [self monitorNetwork];
+
+    dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+        DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    if (source) {
+        __weak CVPNMobileTunnel *weakTunnel = tunnel;
+        __weak dispatch_source_t weakSource = source;
+        dispatch_source_set_event_handler(source, ^{
+            dispatch_source_t strongSource = weakSource;
+            if (strongSource) {
+                [weakTunnel trimMemory:(dispatch_source_get_data(strongSource) & DISPATCH_MEMORYPRESSURE_CRITICAL) != 0];
+            }
+        });
+        self->_memoryPressure = source;
+        dispatch_resume(source);
+    }
+    completion(nil);
+}
+
+- (void)monitorNetwork {
+    _pathMonitor = nw_path_monitor_create();
+    if (!_pathMonitor) return;
+    nw_path_monitor_set_queue(_pathMonitor, _queue);
+    __weak CVPNPacketFlow *weakSelf = self;
+    uint64_t generation = _generation;
+    nw_path_monitor_set_update_handler(_pathMonitor, ^(nw_path_t path) {
+        CVPNPacketFlow *bridge = weakSelf;
+        if (!bridge || bridge->_generation != generation || !bridge->_tunnel) return;
+        nw_path_t previous = bridge->_lastPath;
+        bridge->_lastPath = path;
+        // Coalesce matching notifications. Reset on recovery or when the
+        // usable route changes. No load is generated while the network is down.
+        if (previous && nw_path_get_status(path) == nw_path_status_satisfied && !nw_path_is_equal(previous, path)) {
+            [bridge->_tunnel networkChanged];
+        }
+    });
+    nw_path_monitor_start(_pathMonitor);
 }
 
 - (void)readNext {
@@ -97,6 +182,12 @@
 - (void)stopWithCompletion:(dispatch_block_t)completion {
     dispatch_async(_queue, ^{
         self->_generation++;
+        self->_starting = NO;
+        if (self->_pathMonitor) {
+            nw_path_monitor_cancel(self->_pathMonitor);
+            self->_pathMonitor = nil;
+        }
+        self->_lastPath = nil;
         if (self->_memoryPressure) {
             dispatch_source_cancel(self->_memoryPressure);
             self->_memoryPressure = nil;

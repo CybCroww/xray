@@ -5,13 +5,25 @@ On iOS, embed `CVPNCore.xcframework` in the Packet Tunnel extension and compile
 `bash mobile/ios/build.sh` on a Mac with Xcode. The `iOS core` workflow checks the
 native bridge and produces a ZIP containing the device and simulator slices.
 
-The extension owns `NEPacketTunnelNetworkSettings`, routes and DNS. After
-`setTunnelNetworkSettings` succeeds, retain a `CVPNPacketFlow` constructed from
-`packetFlow`, then call `startWithConfig:mtu:completion:`. Pass one Xray `tun`
-inbound and the app's desired outbound(s) in the JSON. Use the same MTU in both
-places. Call `stopWithCompletion:` from the provider's stop callback. The
-bridge uses only public packet flow APIs and has no dependency on utun fd
-discovery. It starts exactly one outstanding native read at a time.
+Before saving the host app's `NETunnelProviderProtocol`, apply
+`CVPNRequireProtectedRouting`. This enables Apple's `includeAllNetworks`;
+it still has Apple's system exceptions and is not supervised Always On VPN.
+Do not remove or reapply routes on a network change. Use `CVPNFullTunnelSettings`
+for default IPv4 and IPv6 routes and a catch-all DNS resolver. The provided
+resolver IPs are destinations inside the tunnel, not direct bootstrap servers.
+Retain a `CVPNPacketFlow` built with `initWithProvider:` and call
+`startWithConfig:mtu:resolverIPs:completion:`. It checks the current VPN profile
+and applies tunnel settings before starting the core.
+Call `stopWithCompletion:` from the provider's stop callback.
+
+The bridge requests the protected core profile. Pass one `tun` inbound and
+supported TLS/REALITY VPN outbounds; put their resolved endpoint IPs in their
+addresses and retain the TLS server names. The core rejects direct fallbacks
+and core-local DNS. When the native network path changes it clears stale
+XHTTP, gRPC and Hysteria clients and resets app flows without tearing down the
+packet tunnel or changing the endpoint. TCP streams that lost their remote
+path still have to reconnect. The monitor uses system events without probes.
+The bridge only uses public packet flow APIs and keeps a single pending read.
 
 The extension has a 32 MiB Go runtime soft target by default. Packet storage is
 bounded independently of the garbage collector: a 128-packet input ring,
@@ -23,7 +35,10 @@ packet sizes reduce the maximum transfer rate at a given request interval, so
 measure throughput in addition to memory before changing these defaults.
 
 `takeMemorySnapshot:` reports the iOS process footprint, available process
-memory, Go memory and packet drop counters. A warning trims idle XHTTP pools;
+memory, Go memory, packet drops, network changes, and logical XHTTP upload
+requests and bytes (excluding wire overhead). XHTTP combines writes already
+waiting at send time, without extending the configured interval, and avoids
+duplicate TCP keepalives when HTTP/2 liveness checks are enabled. A warning trims idle XHTTP pools;
 a critical pressure event also asks Go to release unused pages (rate limited).
 The Go memory target is not an iOS memory cap.
 

@@ -90,8 +90,7 @@ func TestMobilePacketUploadsBackpressureAndCancel(t *testing.T) {
 		t.Fatal("writer did not apply backpressure")
 	case <-time.After(100 * time.Millisecond):
 	}
-	first.Close()
-	second.Close()
+	resetClientNetwork(limits)
 	for i := 0; i < budget; i++ {
 		select {
 		case <-stopped:
@@ -109,6 +108,13 @@ func TestMobilePacketUploadsBackpressureAndCancel(t *testing.T) {
 			t.Fatal("write stayed blocked after closing the tunnel")
 		}
 	}
+	first.Close()
+	second.Close()
+	retry, err := dial(ctx, destination, settings, limits)
+	if err != nil {
+		t.Fatalf("new path could not dial after canceling old sockets: %v", err)
+	}
+	retry.Close()
 }
 
 func TestMobilePacketUploadKeepsHeaderTransport(t *testing.T) {

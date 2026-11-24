@@ -138,6 +138,27 @@ func (s *stack) Start() error {
 	return nil
 }
 
+// ResetFlows fails sockets tied to a previous network while keeping the
+// packet reader and routes available. New flows use the current network.
+func (s *stack) ResetFlows() {
+	s.mu.Lock()
+	conns := make([]*tcpConn, 0, len(s.conns))
+	for _, c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	if s.udp != nil {
+		s.udp.reset(false)
+	}
+	for _, c := range conns {
+		c.mu.Lock()
+		if c.err == nil {
+			c.reset()
+		}
+		c.mu.Unlock()
+	}
+}
+
 // Close is called by Handler to shut down the stack
 func (s *stack) Close() error {
 	s.mu.Lock()

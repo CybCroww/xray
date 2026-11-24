@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"runtime/debug"
+	"strings"
 	"testing"
 	"time"
 )
@@ -67,6 +68,19 @@ func TestEmbeddedPacketTunnelUDPAndRestart(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatal("no response from the external UDP echo")
 		}
+		tunnel.NetworkChanged()
+		body[0] += 10
+		if !tunnel.PushPacket(makeUDP4(body, uint16(server.LocalAddr().(*net.UDPAddr).Port))) {
+			t.Fatal("packet flow stopped accepting input after path change")
+		}
+		select {
+		case response := <-packets:
+			if len(response) != 28+len(body) || string(response[28:]) != string(body) {
+				t.Fatalf("wrong response after path change: %x", response)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("UDP did not recover on a new flow")
+		}
 		if !json.Valid([]byte(tunnel.MemoryStatsJSON())) {
 			t.Fatal("invalid diagnostics")
 		}
@@ -79,6 +93,37 @@ func TestEmbeddedPacketTunnelUDPAndRestart(t *testing.T) {
 		if debug.SetMemoryLimit(-1) != oldLimit {
 			t.Fatal("process memory target was not restored")
 		}
+	}
+}
+
+func TestProtectedProfileRejectsDirectFallbackAndUnresolvedTransport(t *testing.T) {
+	const proxy = `{"tag":"vpn","protocol":"vless","settings":{"address":"192.0.2.1","port":443,"id":"5df75106-58cf-4c35-a8c8-71976ebc62a6","encryption":"none"},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"test.example"}}}`
+	config := func(outbounds string) string {
+		return `{"log":{"loglevel":"none"},"inbounds":[{"protocol":"tun"}],"outbounds":[` + outbounds + `]}`
+	}
+	for name, invalid := range map[string]string{
+		"direct fallback":        config(proxy + `,{"tag":"direct","protocol":"freedom"}`),
+		"hostname":               config(strings.Replace(proxy, "192.0.2.1", "test.example", 1)),
+		"insecure TLS":           config(strings.Replace(proxy, `"serverName":`, `"allowInsecure":true,"serverName":`, 1)),
+		"download host in extra": config(strings.Replace(proxy, `"network":"xhttp",`, `"network":"xhttp","xhttpSettings":{"extra":{"downloadSettings":{"address":"test.example","network":"xhttp","security":"tls"}}},`, 1)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			tunnel, err := StartProtected(invalid, make(capturePackets, 1), 1280, 32)
+			if err == nil {
+				tunnel.Stop()
+				t.Fatal("unsafe configuration accepted")
+			}
+		})
+	}
+	tunnel, err := StartProtected(config(proxy+`,{"tag":"block","protocol":"blackhole"}`), make(capturePackets, 1), 1280, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.Stop()
+	tunnel.NetworkChanged()
+	var stats struct{ NetworkChanges uint64 }
+	if err := json.Unmarshal([]byte(tunnel.MemoryStatsJSON()), &stats); err != nil || stats.NetworkChanges != 1 {
+		t.Fatalf("path change not delivered to running stack: %+v, %v", stats, err)
 	}
 }
 

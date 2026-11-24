@@ -16,6 +16,16 @@ func (r *Reader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	return r.pipe.ReadMultiBuffer()
 }
 
+// TryReadMultiBuffer takes buffered content without waiting. A nil result means
+// there is nothing ready; use ReadMultiBuffer to wait or observe a terminal error.
+func (r *Reader) TryReadMultiBuffer() buf.MultiBuffer {
+	data, _ := r.pipe.readMultiBufferInternal()
+	if data != nil {
+		r.pipe.writeSignal.Signal()
+	}
+	return data
+}
+
 // ReadMultiBufferTimeout reads content from a pipe within the given duration, or returns buf.ErrTimeout otherwise.
 func (r *Reader) ReadMultiBufferTimeout(d time.Duration) (buf.MultiBuffer, error) {
 	return r.pipe.ReadMultiBufferTimeout(d)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/netip"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/xtls/xray-core/common"
@@ -33,6 +34,10 @@ type Handler struct {
 	stack           Stack
 	tun             Tun
 	hostDevice      Tun
+	registerReset   func(func())
+	flowMu          sync.Mutex
+	flowCtx         context.Context
+	cancelFlows     context.CancelFunc
 	policyManager   policy.Manager
 	dispatcher      routing.Dispatcher
 	tag             string
@@ -93,6 +98,7 @@ var _ common.Runnable = (*Handler)(nil)
 // Init the Handler instance with necessary parameters
 func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routing.Dispatcher) error {
 	t.hostDevice, _ = ctx.Value(deviceKey{}).(Tun)
+	t.registerReset, _ = ctx.Value(flowsKey{}).(func(func()))
 	// Retrieve tag and sniffing config from context (set by AlwaysOnInboundHandler)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		t.tag = inbound.Tag
@@ -102,6 +108,10 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 	}
 
 	t.ctx, t.cancel = context.WithCancel(core.ToBackgroundDetachedContext(ctx))
+	t.flowCtx = t.ctx
+	if t.registerReset != nil {
+		t.flowCtx, t.cancelFlows = context.WithCancel(t.ctx)
+	}
 	t.policyManager = pm
 	t.dispatcher = dispatcher
 
@@ -214,6 +224,17 @@ func (t *Handler) Start() error {
 
 	t.stack = tunStack
 	t.tun = tunInterface
+	if t.registerReset != nil {
+		if resettable, ok := tunStack.(interface{ ResetFlows() }); ok {
+			t.registerReset(func() {
+				t.flowMu.Lock()
+				defer t.flowMu.Unlock()
+				t.cancelFlows()
+				resettable.ResetFlows()
+				t.flowCtx, t.cancelFlows = context.WithCancel(t.ctx)
+			})
+		}
+	}
 
 	errors.LogInfo(t.ctx, tunName, " up")
 	return nil
@@ -225,7 +246,13 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	// to close, send completion packets back to the network, and cleanup
 	defer conn.Close()
 
-	ctx, cancel := context.WithCancel(t.ctx)
+	ctx := t.ctx
+	if t.registerReset != nil {
+		t.flowMu.Lock()
+		ctx = t.flowCtx
+		t.flowMu.Unlock()
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	ctx = c.ContextWithID(ctx, session.NewID())
 
