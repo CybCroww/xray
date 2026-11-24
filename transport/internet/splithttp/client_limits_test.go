@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	stdnet "net"
 	"net/http"
@@ -13,8 +14,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -23,6 +26,81 @@ import (
 type streamRoundTripper func(*http.Request) (*http.Response, error)
 
 func (f streamRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestMobileUploadRetainsBodyThroughRetry(t *testing.T) {
+	for _, cancelled := range []bool{false, true} {
+		name := "response before body close"
+		if cancelled {
+			name = "request canceled"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				want := bytes.Repeat([]byte("upload"), 2000)
+				payload := buf.MergeBytes(nil, want)
+				replayed := make(chan io.ReadCloser, 1)
+				client := DefaultDialerClient{
+					mobile: true, httpVersion: "2", transportConfig: &Config{Path: "/test/"},
+					client: &http.Client{Transport: streamRoundTripper(func(req *http.Request) (*http.Response, error) {
+						var prefix [32]byte
+						if _, err := io.ReadFull(req.Body, prefix[:]); err != nil {
+							return nil, err
+						}
+						req.Body.Close()
+						if req.ContentLength != int64(len(want)) || !bytes.Equal(prefix[:], want[:len(prefix)]) {
+							return nil, errors.New("original request body has the wrong payload")
+						}
+						body, err := req.GetBody()
+						if err != nil {
+							return nil, err
+						}
+						replayed <- body
+						return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+					})},
+				}
+				result := make(chan error, 1)
+				go func() { result <- client.PostPacket(ctx, "https://test.invalid/test/", "session", "0", payload) }()
+				var replay io.ReadCloser
+				select {
+				case replay = <-replayed:
+				case err := <-result:
+					t.Fatalf("upload returned before replay: %v", err)
+				}
+				synctest.Wait()
+				select {
+				case err := <-result:
+					t.Fatalf("upload returned before its active body closed: %v", err)
+				default:
+				}
+				if cancelled {
+					cancel()
+					if err := <-result; !errors.Is(err, context.Canceled) {
+						t.Fatalf("canceled upload returned %v", err)
+					}
+					if _, err := replay.Read(make([]byte, 1)); !errors.Is(err, io.ErrClosedPipe) {
+						t.Fatalf("read after canceled upload returned %v", err)
+					}
+					replay.Close()
+				} else {
+					got, err := io.ReadAll(replay)
+					replay.Close()
+					if err != nil || !bytes.Equal(got, want) {
+						t.Fatalf("replay read %d bytes, want %d: %v", len(got), len(want), err)
+					}
+					if err := <-result; err != nil {
+						t.Fatal(err)
+					}
+				}
+				for _, buffer := range payload {
+					if buffer != nil {
+						t.Fatal("upload retained its packet buffers")
+					}
+				}
+			})
+		})
+	}
+}
 
 func TestMobilePathChangeClosesPendingTLS(t *testing.T) {
 	for _, protocol := range []string{"http/1.1", "h2"} {

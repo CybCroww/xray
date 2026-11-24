@@ -339,6 +339,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 			Transport: transport,
 		},
 		httpVersion:    httpVersion,
+		mobile:         mobile,
 		uploadRawPool:  &sync.Pool{},
 		dialUploadConn: dialContext,
 	}

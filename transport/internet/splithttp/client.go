@@ -37,6 +37,7 @@ type DefaultDialerClient struct {
 	client          *http.Client
 	closed          atomic.Bool
 	httpVersion     string
+	mobile          bool
 	packetHTTP1     *http.Client
 	downlinkTimeout time.Duration
 	// pool of net.Conn, created using dialUploadConn
@@ -147,7 +148,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 	}
 }
 
-func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessionId string, seqStr string, payload buf.MultiBuffer) error {
+func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessionId string, seqStr string, payload buf.MultiBuffer) (err error) {
 	method := c.transportConfig.GetNormalizedUplinkHTTPMethod()
 	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
@@ -156,7 +157,20 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	}
 
 	if c.httpVersion != "1.1" || c.packetHTTP1 != nil {
-		c.transportConfig.FillPacketRequest(req, sessionId, seqStr, payload)
+		if c.mobile {
+			if c.prepareReplayablePacketRequest(req, sessionId, seqStr, payload) {
+				body := &mobilePacketUpload{payload: payload}
+				req.Body, _ = body.open()
+				req.GetBody = body.open
+				defer func() {
+					if finishErr := body.finish(ctx, err == nil); err == nil {
+						err = finishErr
+					}
+				}()
+			}
+		} else {
+			c.transportConfig.FillPacketRequest(req, sessionId, seqStr, payload)
+		}
 		client := c.client
 		if c.packetHTTP1 != nil {
 			client = c.packetHTTP1
@@ -178,7 +192,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 		_, err = io.Copy(io.Discard, resp.Body)
 		return err
 	} else {
-		replayBody := c.prepareHTTP1PacketRequest(req, sessionId, seqStr, payload)
+		replayBody := c.prepareReplayablePacketRequest(req, sessionId, seqStr, payload)
 		if replayBody {
 			defer buf.ReleaseMulti(payload)
 		}
@@ -263,7 +277,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	return nil
 }
 
-func (c *DefaultDialerClient) prepareHTTP1PacketRequest(req *http.Request, sessionId string, seqStr string, payload buf.MultiBuffer) bool {
+func (c *DefaultDialerClient) prepareReplayablePacketRequest(req *http.Request, sessionId string, seqStr string, payload buf.MultiBuffer) bool {
 	dataPlacement := c.transportConfig.GetNormalizedUplinkDataPlacement()
 	if dataPlacement != PlacementBody && dataPlacement != PlacementAuto {
 		c.transportConfig.FillPacketRequest(req, sessionId, seqStr, payload)
@@ -283,10 +297,8 @@ type replayMultiBufferBody struct {
 }
 
 func (b *replayMultiBufferBody) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	for b.index < len(b.payload) {
+	written := 0
+	for b.index < len(b.payload) && written < len(p) {
 		buffer := b.payload[b.index]
 		if buffer == nil {
 			b.index++
@@ -299,9 +311,12 @@ func (b *replayMultiBufferBody) Read(p []byte) (int, error) {
 			b.offset = 0
 			continue
 		}
-		n := copy(p, data)
+		n := copy(p[written:], data)
 		b.offset += int32(n)
-		return n, nil
+		written += n
+	}
+	if written != 0 || len(p) == 0 {
+		return written, nil
 	}
 	return 0, io.EOF
 }
