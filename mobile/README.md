@@ -19,7 +19,8 @@ Call `stopWithCompletion:` from the provider's stop callback.
 The bridge requests the protected core profile. Pass one `tun` inbound and
 supported TLS/REALITY VPN outbounds; put their resolved endpoint IPs in their
 addresses and retain the TLS server names. The core rejects direct fallbacks
-and core-local DNS. When the native network path changes it clears stale
+and core-local DNS. Leave VLESS background preconnect disabled.
+When the native network path changes the core clears stale
 XHTTP, gRPC and Hysteria clients and resets app flows without tearing down the
 packet tunnel or changing the endpoint. It cancels old flow contexts before
 retiring the transport pools and admitting new flows. TCP streams that lost
@@ -49,6 +50,10 @@ waiting at send time, without extending the configured interval, and avoids
 duplicate TCP keepalives when HTTP/2 liveness checks are enabled. A warning trims idle XHTTP pools;
 a critical pressure event also asks Go to release unused pages (rate limited).
 The Go memory target is not an iOS memory cap.
+
+`go test ./mobile -run TestProtectedTunnelTrafficStaysOnVPN` checks TUN traffic
+over RAW, gRPC and XHTTP on loopback. It covers IPv4 and IPv6 DNS, TCP, withheld
+VPN responses and recovery after a path change.
 
 Before release, run on a signed physical iPhone: sustained XHTTP upload and
 download, multiple simultaneous streams, a slow endpoint, Wi-Fi/cellular

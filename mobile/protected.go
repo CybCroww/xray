@@ -37,8 +37,11 @@ func protectProfile(cfg *conf.Config) error {
 			return errors.New("protected profile does not support an outbound proxy chain or local resolution")
 		}
 		var endpoint struct {
-			Address string                     `json:"address"`
-			Vnext   []struct{ Address string } `json:"vnext"`
+			Address string `json:"address"`
+			Vnext   []struct {
+				Address string
+				Users   []struct{ Testpre uint32 }
+			} `json:"vnext"`
 			Servers []struct{ Address string } `json:"servers"`
 			Testpre uint32                     `json:"testpre"`
 			Reverse json.RawMessage            `json:"reverse"`
@@ -47,10 +50,15 @@ func protectProfile(cfg *conf.Config) error {
 			return errors.New("protected profile does not support preconnect or reverse settings")
 		}
 		address := endpoint.Address
-		if address == "" && len(endpoint.Vnext) == 1 {
+		if address == "" && protocol == "vless" && len(endpoint.Vnext) == 1 {
 			address = endpoint.Vnext[0].Address
+			for _, user := range endpoint.Vnext[0].Users {
+				if user.Testpre != 0 {
+					return errors.New("protected profile does not support VLESS preconnect")
+				}
+			}
 		}
-		if address == "" && len(endpoint.Servers) == 1 {
+		if address == "" && protocol == "trojan" && len(endpoint.Servers) == 1 {
 			address = endpoint.Servers[0].Address
 		}
 		if !literalIP(address) {

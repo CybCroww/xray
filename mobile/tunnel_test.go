@@ -128,6 +128,33 @@ func TestProtectedProfileRejectsDirectFallbackAndUnresolvedTransport(t *testing.
 	}
 }
 
+func TestProtectedProfileValidatesLegacyVLESS(t *testing.T) {
+	const outbound = `{"protocol":"vless","settings":{"vnext":[{"address":"192.0.2.1","port":443,"users":[{"id":"5df75106-58cf-4c35-a8c8-71976ebc62a6","encryption":"none"%s}]}]},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"test.example"}}}`
+	for _, test := range []struct {
+		name     string
+		pretest  string
+		rejected bool
+	}{
+		{"normal", "", false},
+		{"preconnect", `,"testpre":1`, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := `{"log":{"loglevel":"none"},"inbounds":[{"protocol":"tun"}],"outbounds":[` + fmt.Sprintf(outbound, test.pretest) + "]}"
+			tunnel, err := StartProtected(config, make(capturePackets, 1), 1280, 32)
+			if tunnel != nil {
+				tunnel.Stop()
+			}
+			if test.rejected {
+				if err == nil || !strings.Contains(err.Error(), "does not support VLESS preconnect") {
+					t.Fatalf("expected rejection of preconnect, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func makeUDP4(payload []byte, port uint16) []byte {
 	b := make([]byte, 28+len(payload))
 	b[0], b[8], b[9] = 0x45, 64, 17
