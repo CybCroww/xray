@@ -62,7 +62,7 @@ func (m *XmuxManager) retire() {
 }
 
 type XmuxManager struct {
-	xmuxConfig  XmuxConfig
+	xmuxConfig  *XmuxConfig
 	concurrency int32
 	connections int32
 	maxPool     int
@@ -70,7 +70,10 @@ type XmuxManager struct {
 	xmuxClients []*XmuxClient
 }
 
-func NewXmuxManager(xmuxConfig XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
+func NewXmuxManager(xmuxConfig *XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
+	if xmuxConfig == nil {
+		xmuxConfig = &XmuxConfig{}
+	}
 	return &XmuxManager{
 		xmuxConfig:  xmuxConfig,
 		concurrency: xmuxConfig.GetNormalizedMaxConcurrency().rand(),
