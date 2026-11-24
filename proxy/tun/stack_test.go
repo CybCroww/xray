@@ -1013,6 +1013,111 @@ func TestTCPWindow(t *testing.T) {
 	p.silent(tcpTick + tcpTick/2)
 }
 
+func TestTCPWriteReleasesAcknowledgedBuffersWhileBlocked(t *testing.T) {
+	conns := make(chan accepted, 1)
+	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
+	newTestStack(t, l, accept(conns))
+	p.window = 32768
+	p.connect(nil)
+	conn := take(t, conns).conn.(*tcpConn)
+
+	const payloadSize, pauseAfter = 512 << 10, 384 << 10
+	mb := buf.MergeBytes(nil, make([]byte, payloadSize))
+	done := make(chan error, 1)
+	go func() { done <- conn.WriteMultiBuffer(mb) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		conn.mu.Lock()
+		// Wait until the sender is parked, including on each subsequent
+		// window. There must be new bytes to acknowledge.
+		if conn.blocked && conn.sndNxt != conn.sndUna {
+			acknowledged := conn.sndNxt - p.ack
+			window := p.window
+			if acknowledged >= pauseAfter {
+				window = 0
+			}
+			conn.acknowledge(segment{ack: conn.sndNxt, window: window})
+			retained := conn.sndQueue.Len()
+			conn.mu.Unlock()
+			if window == 0 {
+				if retained > payloadSize-int32(acknowledged)+buf.Size {
+					t.Fatalf("TCP retained %d bytes after acknowledging %d of %d", retained, acknowledged, payloadSize)
+				}
+				t.Logf("retained %d bytes after acknowledging %d of %d", retained, acknowledged, payloadSize)
+				break
+			}
+		} else {
+			conn.mu.Unlock()
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("sender did not reach the blocked window")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	conn.Close()
+	select {
+	case err := <-done:
+		if err != io.ErrClosedPipe {
+			t.Fatalf("blocked write returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("closing connection did not unblock sender")
+	}
+}
+
+func TestTCPResetPreservesBufferUntilDeviceWriteReturns(t *testing.T) {
+	conns := make(chan accepted, 1)
+	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
+	entered, allowReturn := make(chan struct{}), make(chan struct{})
+	var firstWrite, resume sync.Once
+	defer resume.Do(func() { close(allowReturn) })
+	out := l.out
+	l.out = func(packet []byte) {
+		headerSize := ipv4HeaderSize + int(packet[ipv4HeaderSize+12]>>4)*4
+		if len(packet) > headerSize {
+			block := false
+			firstWrite.Do(func() {
+				block = true
+				close(entered)
+			})
+			if block {
+				<-allowReturn
+			}
+		}
+		out(packet)
+	}
+	newTestStack(t, l, accept(conns))
+	p.connect(nil)
+	conn := take(t, conns).conn.(*tcpConn)
+	data := buf.New()
+	data.WriteString("buffer borrowed by the device")
+	done := make(chan error, 1)
+	go func() { done <- conn.WriteMultiBuffer(buf.MultiBuffer{data}) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("device write did not start")
+	}
+
+	conn.mu.Lock()
+	conn.acknowledge(segment{ack: conn.sndNxt, window: p.window})
+	conn.mu.Unlock()
+	conn.Close()
+	if data.IsEmpty() {
+		t.Error("ACK or close released a buffer still borrowed by the device")
+	}
+	resume.Do(func() { close(allowReturn) })
+	select {
+	case err := <-done:
+		if err != io.ErrClosedPipe || !data.IsEmpty() {
+			t.Fatalf("aborted write returned %v with %d bytes retained", err, data.Len())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("aborted write did not return")
+	}
+}
+
 // A keepalive is answered, and not before a segment that was made before it is written.
 func TestTCPKeepalive(t *testing.T) {
 	conns := make(chan accepted, 1)

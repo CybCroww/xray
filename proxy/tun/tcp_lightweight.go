@@ -141,6 +141,7 @@ type tcpConn struct {
 	stampBase, stampSent uint32
 
 	mu       sync.Mutex
+	writerMu sync.Mutex
 	readable sync.Cond
 	writable sync.Cond
 
@@ -177,8 +178,9 @@ type tcpConn struct {
 	// sndBase is the sequence number of the first byte of sndQueue
 	sndBase uint32
 	sndFin  bool
-	// writing is how many of the last of sndQueue WriteMultiBuffer is sending, it is the only one to release them
-	writing int
+	// writing is set while WriteMultiBuffer owns the write, including while
+	// waiting for the receiver's window to reopen.
+	writing bool
 	// blocked is set while WriteMultiBuffer waits for the window
 	blocked bool
 	// sending is set while WriteMultiBuffer writes a segment without mu, ackWanted if sendAck was called meanwhile
@@ -816,6 +818,7 @@ func (c *tcpConn) receive(s segment) {
 			c.rcvNxt += uint32(h.data.Len() - before)
 		}
 		h.data.Release()
+		c.rcvHeld[0] = held{}
 		c.rcvHeld = c.rcvHeld[1:]
 	}
 	if fin = fin || c.rcvEnds && c.rcvNxt == c.rcvEnd; fin {
@@ -834,7 +837,12 @@ func (c *tcpConn) receive(s segment) {
 
 // release releases what of sndQueue is acknowledged. c.mu is held
 func (c *tcpConn) release() {
-	for len(c.sndQueue) > c.writing {
+	// WriteMultiBuffer lends slices of these buffers to the device while
+	// unlocked. An ACK or RST may arrive before that write has returned.
+	if c.sending {
+		return
+	}
+	for len(c.sndQueue) > 0 {
 		end := c.sndBase + uint32(c.sndQueue[0].Len())
 		if int32(c.sndUna-end) < 0 {
 			break
@@ -1054,10 +1062,10 @@ func (c *tcpConn) abort(err error) {
 		h.data.Release()
 	}
 	c.rcvHeld = nil
-	for _, b := range c.sndQueue[:len(c.sndQueue)-c.writing] {
-		b.Release()
+	if !c.sending {
+		buf.ReleaseMulti(c.sndQueue)
+		c.sndQueue = nil
 	}
-	c.sndQueue = nil
 	c.readable.Broadcast()
 	c.writable.Broadcast()
 	c.stack.remove(c)
@@ -1112,8 +1120,11 @@ func (c *tcpConn) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// WriteMultiBuffer implements buf.Writer. It is not called again before it returns
+// WriteMultiBuffer implements buf.Writer. Writes remain ordered while waiting
+// for TCP acknowledgments and while the device consumes borrowed packet slices.
 func (c *tcpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	c.writerMu.Lock()
+	defer c.writerMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// without the empty ones
@@ -1132,9 +1143,10 @@ func (c *tcpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		buf.ReleaseMulti(mb)
 		return io.ErrClosedPipe
 	}
-	// what is written is in sndQueue until it is acknowledged, and is not released before all of it is sent
+	// Keep data that can still be retransmitted and release acknowledged
+	// buffers even when the remaining part of this write is blocked.
 	c.sndQueue = append(c.sndQueue, mb...)
-	c.writing = len(mb)
+	c.writing = true
 	// a segment is one part of a Buffer, or as much as there is to send if the tun splits it by itself
 	var room [tcpParts][]byte
 	parts := room[:0:1]
@@ -1192,14 +1204,19 @@ func (c *tcpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 		c.mu.Lock()
 		c.sending = false
-		if c.ackWanted && c.err == nil {
+		if c.err != nil {
+			buf.ReleaseMulti(c.sndQueue)
+			c.sndQueue = nil
+			break
+		}
+		c.release()
+		if c.ackWanted {
 			c.sendAck()
 		}
 		c.ackWanted = false
 	}
-	c.writing = 0
+	c.writing = false
 	if c.err != nil {
-		buf.ReleaseMulti(mb)
 		return io.ErrClosedPipe
 	}
 	c.release()
@@ -1227,7 +1244,7 @@ func (c *tcpConn) Close() error {
 	if c.err != nil {
 		return nil
 	}
-	if unread || c.writing != 0 {
+	if unread || c.writing {
 		// something was not read or not written, the system has to know
 		c.reset()
 		return nil
