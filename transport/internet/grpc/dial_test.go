@@ -21,11 +21,11 @@ func TestNetworkResetRetiresSharedGRPCChannel(t *testing.T) {
 	t.Cleanup(resetCachedChannels)
 	settings := &internet.MemoryStreamConfig{ProtocolName: protocolName, ProtocolSettings: &Config{}}
 	destination := net.TCPDestination(net.LocalHostIP, net.Port(1))
-	old, err := getGrpcClient(context.Background(), destination, settings)
+	old, err := getGrpcClient(context.Background(), destination, settings, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	shared, err := getGrpcClient(context.Background(), destination, settings)
+	shared, err := getGrpcClient(context.Background(), destination, settings, false)
 	if err != nil || shared != old {
 		t.Fatal("test did not share the channel")
 	}
@@ -35,12 +35,103 @@ func TestNetworkResetRetiresSharedGRPCChannel(t *testing.T) {
 	}
 	staleCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if conn, err := getGrpcClient(staleCtx, destination, settings); conn != nil || err != context.Canceled {
+	if conn, err := getGrpcClient(staleCtx, destination, settings, false); conn != nil || err != context.Canceled {
 		t.Fatalf("canceled flow repopulated the channel pool: %v, %v", conn, err)
 	}
-	fresh, err := getGrpcClient(context.Background(), destination, settings)
+	fresh, err := getGrpcClient(context.Background(), destination, settings, false)
 	if err != nil || fresh == old || fresh.GetState() == connectivity.Shutdown {
 		t.Fatalf("new channel failed: %v", err)
+	}
+}
+
+type echoTunnelServer struct {
+	encoding.UnimplementedGRPCServiceServer
+}
+
+func (echoTunnelServer) Tun(stream encoding.GRPCService_TunServer) error {
+	for {
+		request, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		if err := stream.Send(request); err != nil {
+			return err
+		}
+	}
+}
+
+func TestMobileGRPCTrimKeepsLiveStreams(t *testing.T) {
+	t.Cleanup(resetCachedChannels)
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cfg := &Config{}
+	server := grpc.NewServer()
+	defer server.Stop()
+	encoding.RegisterGRPCServiceServerX(server, echoTunnelServer{}, cfg.getServiceName(), cfg.getTunStreamName(), cfg.getTunMultiStreamName())
+	go server.Serve(ln)
+	dest := net.TCPDestination(net.LocalHostIP, net.Port(ln.Addr().(*net.TCPAddr).Port))
+	activeSettings := &internet.MemoryStreamConfig{ProtocolName: protocolName, ProtocolSettings: cfg}
+	idleSettings := &internet.MemoryStreamConfig{ProtocolName: protocolName, ProtocolSettings: cfg}
+
+	open := func(ctx context.Context, settings *internet.MemoryStreamConfig) net.Conn {
+		t.Helper()
+		conn, err := dialgRPC(ctx, dest, settings, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		return conn
+	}
+	echo := func(conn net.Conn, message string) {
+		t.Helper()
+		if _, err := io.WriteString(conn, message); err != nil {
+			t.Fatal(err)
+		}
+		response := make([]byte, len(message))
+		if _, err := io.ReadFull(conn, response); err != nil || string(response) != message {
+			t.Fatalf("echo response %q: %v", response, err)
+		}
+	}
+	cached := func(settings *internet.MemoryStreamConfig) *cachedChannel {
+		globalDialerAccess.Lock()
+		defer globalDialerAccess.Unlock()
+		return globalDialerMap[dialerConf{dest, settings, true}]
+	}
+	first, active := open(ctx, activeSettings), open(ctx, activeSettings)
+	echo(first, "first")
+	echo(active, "active")
+	activeChannel := cached(activeSettings)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	idleCtx, cancelIdle := context.WithCancel(ctx)
+	defer cancelIdle()
+	idle := open(idleCtx, idleSettings)
+	echo(idle, "will become idle")
+	idleChannel := cached(idleSettings)
+	cancelIdle()
+	// Parent cancellation must return the lease even if the caller has not
+	// yet closed the connection object.
+	for cached(idleSettings) != nil && ctx.Err() == nil {
+		TrimIdleClients()
+		time.Sleep(time.Millisecond)
+	}
+	if cached(idleSettings) != nil || idleChannel.GetState() != connectivity.Shutdown {
+		t.Fatal("trimming retained the canceled stream's channel")
+	}
+	if cached(activeSettings) != activeChannel || activeChannel.GetState() == connectivity.Shutdown {
+		t.Fatal("trim closed a shared channel that still had a live stream")
+	}
+	echo(active, "still active")
+	echo(open(ctx, idleSettings), "reconnected")
+	if fresh := cached(idleSettings); fresh == nil || fresh == idleChannel {
+		t.Fatal("reconnect reused a retired channel")
 	}
 }
 
@@ -201,7 +292,7 @@ func TestGRPCCloseCancelsBlockedReceive(t *testing.T) {
 			encoding.RegisterGRPCServiceServerX(server, service, cfg.getServiceName(), cfg.getTunStreamName(), cfg.getTunMultiStreamName())
 			go server.Serve(ln)
 			dest := net.TCPDestination(net.LocalHostIP, net.Port(ln.Addr().(*net.TCPAddr).Port))
-			conn, err := dialgRPC(ctx, dest, settings)
+			conn, err := dialgRPC(ctx, dest, settings, false)
 			if err != nil {
 				t.Fatal(err)
 			}

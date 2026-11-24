@@ -28,7 +28,7 @@ import (
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	errors.LogInfo(ctx, "creating connection to ", dest)
 
-	conn, err := dialgRPC(ctx, dest, streamSettings)
+	conn, err := dialgRPC(ctx, dest, streamSettings, runtime.GOOS == "ios" || runtime.GOOS == "android")
 	if err != nil {
 		return nil, errors.New("failed to dial gRPC").Base(err)
 	}
@@ -42,10 +42,22 @@ func init() {
 type dialerConf struct {
 	net.Destination
 	*internet.MemoryStreamConfig
+	mobile bool
+}
+
+type cachedChannel struct {
+	*grpc.ClientConn
+	streams int // protected by globalDialerAccess
+}
+
+func (c *cachedChannel) release() {
+	globalDialerAccess.Lock()
+	c.streams--
+	globalDialerAccess.Unlock()
 }
 
 var (
-	globalDialerMap    map[dialerConf]*grpc.ClientConn
+	globalDialerMap    map[dialerConf]*cachedChannel
 	globalDialerAccess sync.Mutex
 )
 
@@ -68,18 +80,45 @@ func resetCachedChannels() {
 	}
 }
 
-func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
+// TrimIdleClients releases mobile channels with no live streams, including
+// channels that are still kept warm by gRPC's idle timeout.
+func TrimIdleClients() {
+	var idle []*cachedChannel
+	globalDialerAccess.Lock()
+	for key, channel := range globalDialerMap {
+		if key.mobile && channel.streams == 0 {
+			delete(globalDialerMap, key)
+			idle = append(idle, channel)
+		}
+	}
+	globalDialerAccess.Unlock()
+	for _, channel := range idle {
+		channel.Close()
+	}
+}
+
+func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig, mobile bool) (net.Conn, error) {
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
 
-	conn, err := getGrpcClient(ctx, dest, streamSettings)
+	channel, err := getGrpcClient(ctx, dest, streamSettings, mobile)
 	if err != nil {
 		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
-	client := encoding.NewGRPCServiceClient(conn)
+	client := encoding.NewGRPCServiceClient(channel)
 	streamCtx, cancel := context.WithCancel(ctx)
+	if mobile {
+		stopRelease := context.AfterFunc(streamCtx, channel.release)
+		cancelStream := cancel
+		cancel = func() {
+			releaseHere := stopRelease()
+			cancelStream()
+			if releaseHere {
+				channel.release()
+			}
+		}
+	}
 	if grpcSettings.MultiMode {
 		errors.LogDebug(ctx, "using gRPC multi mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunMultiStreamName()+"`")
-		mobile := runtime.GOOS == "ios" || runtime.GOOS == "android"
 		conn, err := encoding.OpenMultiHunkConn(streamCtx, cancel, client.(encoding.GRPCServiceClientX),
 			grpcSettings.getServiceName(), grpcSettings.getTunMultiStreamName(), mobile)
 		if err != nil {
@@ -99,7 +138,7 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 	return encoding.NewHunkConn(grpcService, cancel, nil), nil
 }
 
-func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
+func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig, mobile bool) (*cachedChannel, error) {
 	globalDialerAccess.Lock()
 	defer globalDialerAccess.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -107,16 +146,23 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 	}
 
 	if globalDialerMap == nil {
-		globalDialerMap = make(map[dialerConf]*grpc.ClientConn)
+		globalDialerMap = make(map[dialerConf]*cachedChannel)
+	}
+	key := dialerConf{dest, streamSettings, mobile}
+	if client := globalDialerMap[key]; client != nil && client.GetState() != connectivity.Shutdown {
+		if mobile {
+			client.streams++
+		}
+		return client, nil
 	}
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
 
-	if client, found := globalDialerMap[dialerConf{dest, streamSettings}]; found && client.GetState() != connectivity.Shutdown {
-		return client, nil
-	}
-
+	// The cached channel needs socket routing metadata, not the first
+	// stream's entire context and its connection objects.
+	sessionID := c.IDFromContext(ctx)
+	outbounds := session.OutboundsFromContext(ctx)
 	dialOptions := []grpc.DialOption{
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
@@ -147,8 +193,8 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 			}
 			address := net.ParseAddress(rawHost)
 
-			gctx = c.ContextWithID(gctx, c.IDFromContext(ctx))
-			gctx = session.ContextWithOutbounds(gctx, session.OutboundsFromContext(ctx))
+			gctx = c.ContextWithID(gctx, sessionID)
+			gctx = session.ContextWithOutbounds(gctx, outbounds)
 			gctx = session.ContextWithTimeoutOnly(gctx, true)
 
 			var c net.Conn
@@ -194,7 +240,10 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		}))
 	}
 
-	dialOptions = appendReceiveWindowOptions(dialOptions, grpcSettings.InitialWindowsSize, runtime.GOOS == "ios" || runtime.GOOS == "android")
+	dialOptions = appendReceiveWindowOptions(dialOptions, grpcSettings.InitialWindowsSize, mobile)
+	if mobile {
+		dialOptions = append(dialOptions, grpc.WithIdleTimeout(net.ConnIdleTimeout))
+	}
 
 	var grpcDestHost string
 	if dest.Address.Family().IsDomain() {
@@ -207,24 +256,31 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		"passthrough:///"+net.JoinHostPort(grpcDestHost, dest.Port.String()),
 		dialOptions...,
 	)
-	if err == nil {
-		userAgent := grpcSettings.UserAgent
-		// It's NOT recommended to set the UA of gRPC connections to that of real browsers, as they are fundamentally incapable of initiating real gRPC connections.
-		switch userAgent {
-		case "chrome", "":
-			userAgent = utils.ChromeUA
-		case "firefox":
-			userAgent = utils.FirefoxUA
-		case "edge":
-			userAgent = utils.MSEdgeUA
-		case "golang":
-			userAgent = ""
-		}
-		setUserAgent(conn, userAgent)
-		conn.Connect()
-		globalDialerMap[dialerConf{dest, streamSettings}] = conn
+	if err != nil {
+		return nil, err
 	}
-	return conn, err
+	userAgent := grpcSettings.UserAgent
+	// It's NOT recommended to set the UA of gRPC connections to that of real browsers, as they are fundamentally incapable of initiating real gRPC connections.
+	switch userAgent {
+	case "chrome", "":
+		userAgent = utils.ChromeUA
+	case "firefox":
+		userAgent = utils.FirefoxUA
+	case "edge":
+		userAgent = utils.MSEdgeUA
+	case "golang":
+		userAgent = ""
+	}
+	setUserAgent(conn, userAgent)
+	channel := &cachedChannel{ClientConn: conn}
+	if mobile {
+		channel.streams = 1
+		// NewStream connects on demand for the first live RPC.
+	} else {
+		conn.Connect()
+	}
+	globalDialerMap[key] = channel
+	return channel, nil
 }
 
 func appendReceiveWindowOptions(options []grpc.DialOption, configured int32, mobile bool) []grpc.DialOption {

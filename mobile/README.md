@@ -58,8 +58,10 @@ throughput on high-latency links.
 memory, Go memory, packet drops, network changes, and logical XHTTP upload
 requests and bytes (excluding wire overhead). XHTTP combines writes already
 waiting at send time, without extending the configured interval, and avoids
-duplicate TCP keepalives when HTTP/2 liveness checks are enabled. A warning trims idle XHTTP pools;
-a critical pressure event also asks Go to release unused pages (rate limited).
+duplicate TCP keepalives when HTTP/2 liveness checks are enabled. A warning
+trims idle XHTTP and gRPC channels. Mobile gRPC connects on demand and enters
+idle mode after 30 seconds without RPCs. A critical pressure event also asks
+Go to release unused pages (rate limited).
 The Go memory target is not an iOS memory cap.
 
 `go test ./mobile -run TestProtectedTunnelTrafficStaysOnVPN` checks TUN traffic

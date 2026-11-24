@@ -241,7 +241,7 @@ func (t *Tunnel) Stop() error {
 	return err
 }
 
-// TrimMemory drops idle XHTTP pools without disrupting active flows. On a
+// TrimMemory drops idle XHTTP and gRPC pools without disrupting active flows. On a
 // critical signal it also asks Go to release heap pages, at most once per 10s.
 // Call from a utility queue and never from the packet I/O callback.
 func (t *Tunnel) TrimMemory(critical bool) {
@@ -249,6 +249,7 @@ func (t *Tunnel) TrimMemory(critical bool) {
 		return
 	}
 	splithttp.TrimIdleClients()
+	grpctransport.TrimIdleClients()
 	if critical {
 		now := time.Now().UnixNano()
 		previous := t.lastTrim.Load()
