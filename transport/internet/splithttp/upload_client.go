@@ -3,7 +3,6 @@ package splithttp
 import (
 	"context"
 	"net/http/httptrace"
-	"runtime"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -48,13 +47,6 @@ func newClientLimits(flows, packets int) *clientLimits {
 }
 
 var mobileLimits = newClientLimits(64, 24)
-
-func platformClientLimits() *clientLimits {
-	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
-		return mobileLimits
-	}
-	return nil
-}
 
 func acquireSlot(ctx context.Context, slots chan struct{}) bool {
 	if ctx.Err() != nil {

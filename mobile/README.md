@@ -69,9 +69,11 @@ idle mode after 30 seconds without RPCs. A critical pressure event also asks
 Go to release unused pages (rate limited).
 The Go memory target is not an iOS memory cap.
 
-`go test ./mobile -run TestProtectedTunnelTrafficStaysOnVPN` checks TUN traffic
-over RAW, gRPC and XHTTP on loopback. It covers IPv4 and IPv6 DNS, TCP, withheld
-VPN responses and recovery after a path change.
+`go test ./mobile -run TestProtectedTunnelTrafficStaysOnVPN` runs the embedded
+mobile profile on loopback. It covers RAW, both gRPC modes, XHTTP over HTTP/2
+and HTTP/3, and XHTTP with GET uploads in headers. Each case checks TCP and DNS
+over both IP versions, withheld VPN responses and a fresh dial after a path
+change.
 
 Before release, run on a signed physical iPhone: sustained XHTTP upload and
 download, multiple simultaneous streams, a slow endpoint, Wi-Fi/cellular

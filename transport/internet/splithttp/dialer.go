@@ -363,7 +363,11 @@ func TrimIdleClients() {
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
-	return dial(ctx, dest, streamSettings, platformClientLimits())
+	var limits *clientLimits
+	if internet.UsesMobileProfile(ctx) {
+		limits = mobileLimits
+	}
+	return dial(ctx, dest, streamSettings, limits)
 }
 
 func dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig, limits *clientLimits) (stat.Connection, error) {

@@ -3,7 +3,6 @@ package grpc
 import (
 	"context"
 	"reflect"
-	"runtime"
 	"sync"
 	"time"
 
@@ -28,7 +27,7 @@ import (
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	errors.LogInfo(ctx, "creating connection to ", dest)
 
-	conn, err := dialgRPC(ctx, dest, streamSettings, runtime.GOOS == "ios" || runtime.GOOS == "android")
+	conn, err := dialgRPC(ctx, dest, streamSettings, internet.UsesMobileProfile(ctx))
 	if err != nil {
 		return nil, errors.New("failed to dial gRPC").Base(err)
 	}
@@ -63,36 +62,23 @@ var (
 
 // ResetMobileNetwork closes cached channels from the previous device path.
 // Keep channel shutdown outside the pool lock so dialing can resume promptly.
-func ResetMobileNetwork() {
-	if runtime.GOOS != "ios" && runtime.GOOS != "android" {
-		return
-	}
-	resetCachedChannels()
-}
-
-func resetCachedChannels() {
-	globalDialerAccess.Lock()
-	old := globalDialerMap
-	globalDialerMap = nil
-	globalDialerAccess.Unlock()
-	for _, conn := range old {
-		conn.Close()
-	}
-}
+func ResetMobileNetwork() { retireMobileChannels(false) }
 
 // TrimIdleClients releases mobile channels with no live streams, including
 // channels that are still kept warm by gRPC's idle timeout.
-func TrimIdleClients() {
-	var idle []*cachedChannel
+func TrimIdleClients() { retireMobileChannels(true) }
+
+func retireMobileChannels(idleOnly bool) {
+	var retired []*cachedChannel
 	globalDialerAccess.Lock()
 	for key, channel := range globalDialerMap {
-		if key.mobile && channel.streams == 0 {
+		if key.mobile && (!idleOnly || channel.streams == 0) {
 			delete(globalDialerMap, key)
-			idle = append(idle, channel)
+			retired = append(retired, channel)
 		}
 	}
 	globalDialerAccess.Unlock()
-	for _, channel := range idle {
+	for _, channel := range retired {
 		channel.Close()
 	}
 }

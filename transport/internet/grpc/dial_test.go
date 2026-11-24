@@ -18,27 +18,40 @@ import (
 )
 
 func TestNetworkResetRetiresSharedGRPCChannel(t *testing.T) {
-	t.Cleanup(resetCachedChannels)
+	t.Cleanup(ResetMobileNetwork)
 	settings := &internet.MemoryStreamConfig{ProtocolName: protocolName, ProtocolSettings: &Config{}}
 	destination := net.TCPDestination(net.LocalHostIP, net.Port(1))
-	old, err := getGrpcClient(context.Background(), destination, settings, false)
+	ordinary, err := getGrpcClient(context.Background(), destination, settings, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	shared, err := getGrpcClient(context.Background(), destination, settings, false)
+	t.Cleanup(func() {
+		globalDialerAccess.Lock()
+		delete(globalDialerMap, dialerConf{destination, settings, false})
+		globalDialerAccess.Unlock()
+		ordinary.Close()
+	})
+	old, err := getGrpcClient(context.Background(), destination, settings, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := getGrpcClient(context.Background(), destination, settings, true)
 	if err != nil || shared != old {
 		t.Fatal("test did not share the channel")
 	}
-	resetCachedChannels()
+	ResetMobileNetwork()
 	if old.GetState() != connectivity.Shutdown {
 		t.Fatal("previous channel was not shut down")
 	}
+	if ordinary.GetState() == connectivity.Shutdown {
+		t.Fatal("the mobile network reset closed a standard channel")
+	}
 	staleCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if conn, err := getGrpcClient(staleCtx, destination, settings, false); conn != nil || err != context.Canceled {
+	if conn, err := getGrpcClient(staleCtx, destination, settings, true); conn != nil || err != context.Canceled {
 		t.Fatalf("canceled flow repopulated the channel pool: %v, %v", conn, err)
 	}
-	fresh, err := getGrpcClient(context.Background(), destination, settings, false)
+	fresh, err := getGrpcClient(context.Background(), destination, settings, true)
 	if err != nil || fresh == old || fresh.GetState() == connectivity.Shutdown {
 		t.Fatalf("new channel failed: %v", err)
 	}
@@ -61,7 +74,7 @@ func (echoTunnelServer) Tun(stream encoding.GRPCService_TunServer) error {
 }
 
 func TestMobileGRPCTrimKeepsLiveStreams(t *testing.T) {
-	t.Cleanup(resetCachedChannels)
+	t.Cleanup(ResetMobileNetwork)
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -276,7 +289,7 @@ func (s silentTunnelServer) wait(ctx context.Context, err error) error {
 func TestGRPCCloseCancelsBlockedReceive(t *testing.T) {
 	for _, multi := range []bool{false, true} {
 		t.Run("multi="+strconv.FormatBool(multi), func(t *testing.T) {
-			t.Cleanup(resetCachedChannels)
+			t.Cleanup(ResetMobileNetwork)
 			ln, err := net.Listen("tcp4", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -292,7 +305,7 @@ func TestGRPCCloseCancelsBlockedReceive(t *testing.T) {
 			encoding.RegisterGRPCServiceServerX(server, service, cfg.getServiceName(), cfg.getTunStreamName(), cfg.getTunMultiStreamName())
 			go server.Serve(ln)
 			dest := net.TCPDestination(net.LocalHostIP, net.Port(ln.Addr().(*net.TCPAddr).Port))
-			conn, err := dialgRPC(ctx, dest, settings, false)
+			conn, err := dialgRPC(ctx, dest, settings, true)
 			if err != nil {
 				t.Fatal(err)
 			}

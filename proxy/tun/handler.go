@@ -107,7 +107,11 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 		t.sniffingRequest = content.SniffingRequest
 	}
 
-	t.ctx, t.cancel = context.WithCancel(core.ToBackgroundDetachedContext(ctx))
+	background := core.ToBackgroundDetachedContext(ctx)
+	if t.hostDevice != nil {
+		background = internet.ContextWithMobileProfile(background)
+	}
+	t.ctx, t.cancel = context.WithCancel(background)
 	t.flowCtx = t.ctx
 	if t.flowReset.register != nil {
 		t.flowCtx, t.cancelFlows = context.WithCancel(t.ctx)

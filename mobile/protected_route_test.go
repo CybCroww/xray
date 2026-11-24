@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -21,6 +22,7 @@ import (
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vless/encoding"
 	testtcp "github.com/xtls/xray-core/testing/servers/tcp"
+	testudp "github.com/xtls/xray-core/testing/servers/udp"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/grpc"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
@@ -68,7 +70,11 @@ func TestProtectedTunnelTrafficStaysOnVPN(t *testing.T) {
 	}{
 		{"raw", "tcp", "", &wiretcp.Config{}, nil},
 		{"grpc", "grpc", `,"grpcSettings":{"serviceName":"cvpn-test"}`, &grpc.Config{ServiceName: "cvpn-test"}, []string{"h2"}},
+		{"grpc-multi", "grpc", `,"grpcSettings":{"serviceName":"cvpn-test","multiMode":true}`, &grpc.Config{ServiceName: "cvpn-test"}, []string{"h2"}},
 		{"xhttp", "splithttp", `,"xhttpSettings":{"path":"/test/","mode":"packet-up"}`, &splithttp.Config{Path: "/test/", Mode: "packet-up"}, []string{"h2"}},
+		{"xhttp-h3", "splithttp", `,"xhttpSettings":{"path":"/test/","mode":"packet-up"}`, &splithttp.Config{Path: "/test/", Mode: "packet-up"}, []string{"h3"}},
+		{"xhttp-header", "splithttp", `,"xhttpSettings":{"path":"/test/","mode":"packet-up","uplinkHTTPMethod":"GET","sessionIDPlacement":"header","seqPlacement":"header","uplinkDataPlacement":"header","uplinkDataKey":"X-Payload"}`,
+			&splithttp.Config{Path: "/test/", Mode: "packet-up", UplinkHTTPMethod: "GET", SessionIDPlacement: "header", SeqPlacement: "header", UplinkDataPlacement: "header", UplinkDataKey: "X-Payload"}, []string{"h2"}},
 	}
 	for _, tc := range transportCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -82,7 +88,12 @@ func TestProtectedTunnelTrafficStaysOnVPN(t *testing.T) {
 			}
 			probes := make(chan xnet.Destination, 16)
 			var dropResponse atomic.Bool
-			port := testtcp.PickPort()
+			var port xnet.Port
+			if len(tc.alpn) == 1 && tc.alpn[0] == "h3" {
+				port = testudp.PickPort()
+			} else {
+				port = testtcp.PickPort()
+			}
 			listener, err := internet.ListenTCP(ctx, xnet.LocalHostIP, port, &internet.MemoryStreamConfig{
 				ProtocolName:     tc.network,
 				ProtocolSettings: tc.config,
@@ -134,12 +145,16 @@ func TestProtectedTunnelTrafficStaysOnVPN(t *testing.T) {
 			audit := &tunnelDialAudit{peer: net.JoinHostPort("127.0.0.1", port.String()), denied: make(chan string, 1)}
 			dialAudit.Store(audit)
 			defer dialAudit.Store(nil)
+			alpn, err := json.Marshal(tc.alpn)
+			if err != nil {
+				t.Fatal(err)
+			}
 			config := fmt.Sprintf(`{
 				"log":{"loglevel":"none"},"inbounds":[{"protocol":"tun"}],"outbounds":[
 					{"protocol":"vless","settings":{"address":"127.0.0.1","port":%d,"id":%q,"encryption":"none"},
-					"streamSettings":{"network":%q,"security":"tls","tlsSettings":{"serverName":"vpn.test","fingerprint":"unsafe","pinnedPeerCertSha256":"%x"}%s}},
+					"streamSettings":{"network":%q,"security":"tls","tlsSettings":{"serverName":"vpn.test","fingerprint":"unsafe","pinnedPeerCertSha256":"%x","alpn":%s}%s}},
 					{"protocol":"blackhole","tag":"block"}
-				]}`, port, id.String(), tc.network, fingerprint, tc.jsonOptions)
+			]}`, port, id.String(), tc.network, fingerprint, alpn, tc.jsonOptions)
 			packets := make(capturePackets, 32)
 			tunnel, err := StartProtected(config, packets, 1280, 0)
 			if err != nil {
@@ -147,20 +162,26 @@ func TestProtectedTunnelTrafficStaysOnVPN(t *testing.T) {
 			}
 			defer tunnel.Stop()
 			query := []byte{0xb0, 0x01, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 'a', 0, 0, 1, 0, 1}
-			dns4 := xnet.UDPDestination(xnet.ParseAddress("192.0.2.1"), 53)
-			dns6 := xnet.UDPDestination(xnet.ParseAddress("2001:db8::1"), 53)
+			addresses := []xnet.Address{xnet.ParseAddress("192.0.2.1"), xnet.ParseAddress("2001:db8::1")}
 			for phase, reply := range []bool{true, false, true} {
 				dropResponse.Store(!reply)
+				dialsBefore := audit.allowed.Load()
 				if phase != 0 {
 					tunnel.NetworkChanged()
 				}
-				for _, dest := range []xnet.Destination{dns4, dns6} {
-					probeDNS(t, tunnel, packets, probes, dest, query, audit.denied, reply)
+				for i, address := range addresses {
+					probeDNS(t, tunnel, packets, probes, xnet.UDPDestination(address, 53), query, audit.denied, reply)
+					probeTCP(t, tunnel, packets, probes, audit.denied, xnet.TCPDestination(address, 443), 23532+uint16(2*phase+i), reply)
 				}
-				probeTCP(t, tunnel, packets, probes, audit.denied, 23532+uint16(phase), reply)
+				if audit.allowed.Load() == dialsBefore {
+					t.Fatalf("phase %d reused a socket from the previous path", phase)
+				}
 			}
-			if audit.allowed.Load() == 0 {
-				t.Fatal("no VPN dial was observed")
+			if tc.network == "splithttp" {
+				requests, _, _ := splithttp.MobileUploadStats()
+				if requests <= tunnel.xhttpRequests {
+					t.Fatal("the embedded tunnel did not use mobile XHTTP limits")
+				}
 			}
 			select {
 			case address := <-audit.denied:
@@ -224,41 +245,48 @@ func expectVPNProbe(t *testing.T, probes <-chan xnet.Destination, denied <-chan 
 	}
 }
 
-func probeTCP(t *testing.T, tunnel *Tunnel, packets capturePackets, probes <-chan xnet.Destination, denied <-chan string, port uint16, wantReply bool) {
+func probeTCP(t *testing.T, tunnel *Tunnel, packets capturePackets, probes <-chan xnet.Destination, denied <-chan string, dest xnet.Destination, port uint16, wantReply bool) {
 	t.Helper()
-	if !tunnel.PushPacket(makeTCP4(port, 100, 0, 0x02, nil)) {
+	ipv6 := dest.Address.Family().IsIPv6()
+	if !tunnel.PushPacket(makeTCPPacket(dest, port, 100, 0, 0x02, nil)) {
 		t.Fatal("TCP SYN rejected")
 	}
-	synAck := waitTCP(t, packets, denied, port, 0x12, nil, 4*time.Second)
+	synAck := waitTCP(t, packets, denied, ipv6, port, 0x12, nil, 4*time.Second)
 	if synAck == nil {
 		t.Fatal("no SYN-ACK from TUN stack")
 	}
-	serverSeq := binary.BigEndian.Uint32(synAck[24:28]) + 1
+	serverSeq := binary.BigEndian.Uint32(synAck[4:8]) + 1
 	payload := []byte("TCP via VPN")
-	if !tunnel.PushPacket(makeTCP4(port, 101, serverSeq, 0x18, payload)) {
+	if !tunnel.PushPacket(makeTCPPacket(dest, port, 101, serverSeq, 0x18, payload)) {
 		t.Fatal("TCP payload rejected")
 	}
-	expectVPNProbe(t, probes, denied, xnet.TCPDestination(xnet.ParseAddress("192.0.2.1"), 443))
+	expectVPNProbe(t, probes, denied, dest)
 	wait := 4 * time.Second
 	if !wantReply {
 		wait = 120 * time.Millisecond
 	}
-	if got := waitTCP(t, packets, denied, port, 0, payload, wait); (got != nil) != wantReply {
+	if got := waitTCP(t, packets, denied, ipv6, port, 0, payload, wait); (got != nil) != wantReply {
 		t.Fatalf("TCP payload received = %t, want %t", got != nil, wantReply)
 	}
 }
 
-func waitTCP(t *testing.T, packets capturePackets, denied <-chan string, port uint16, flags byte, payload []byte, wait time.Duration) []byte {
+func waitTCP(t *testing.T, packets capturePackets, denied <-chan string, ipv6 bool, port uint16, flags byte, payload []byte, wait time.Duration) []byte {
 	t.Helper()
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
+	ipHeader, version, protocolIndex := 20, byte(4), 9
+	if ipv6 {
+		ipHeader, version, protocolIndex = 40, 6, 6
+	}
 	for {
 		select {
 		case packet := <-packets:
-			if len(packet) >= 40 && packet[0] == 0x45 && packet[9] == 6 &&
-				binary.BigEndian.Uint16(packet[22:24]) == port &&
-				packet[33]&flags == flags && bytes.HasSuffix(packet, payload) {
-				return packet
+			if len(packet) < ipHeader+20 || packet[0]>>4 != version || packet[protocolIndex] != 6 {
+				continue
+			}
+			tcp := packet[ipHeader:]
+			if binary.BigEndian.Uint16(tcp[2:4]) == port && tcp[13]&flags == flags && bytes.HasSuffix(tcp, payload) {
+				return tcp
 			}
 		case address := <-denied:
 			t.Fatalf("TCP attempted to leave the VPN via %s", address)
@@ -283,20 +311,34 @@ func makeUDP6(payload []byte, port uint16) []byte {
 	return packet
 }
 
-func makeTCP4(port uint16, seq, ack uint32, flags byte, payload []byte) []byte {
-	packet := make([]byte, 40+len(payload))
-	packet[0], packet[8], packet[9] = 0x45, 64, 6
-	binary.BigEndian.PutUint16(packet[2:], uint16(len(packet)))
-	copy(packet[12:], []byte{198, 18, 0, 2, 192, 0, 2, 1})
-	binary.BigEndian.PutUint16(packet[10:], packetChecksum(packet[:20], 0))
-	binary.BigEndian.PutUint16(packet[20:], port)
-	binary.BigEndian.PutUint16(packet[22:], 443)
-	binary.BigEndian.PutUint32(packet[24:], seq)
-	binary.BigEndian.PutUint32(packet[28:], ack)
-	packet[32], packet[33] = 0x50, flags
-	binary.BigEndian.PutUint16(packet[34:], 65535)
-	copy(packet[40:], payload)
-	binary.BigEndian.PutUint16(packet[36:], packetChecksum(packet[12:], uint32(len(packet)-20)+6))
+func makeTCPPacket(dest xnet.Destination, port uint16, seq, ack uint32, flags byte, payload []byte) []byte {
+	ipHeader, addressAt := 20, 12
+	if dest.Address.Family().IsIPv6() {
+		ipHeader, addressAt = 40, 8
+	}
+	packet := make([]byte, ipHeader+20+len(payload))
+	if ipHeader == 40 {
+		packet[0], packet[6], packet[7] = 0x60, 6, 64
+		binary.BigEndian.PutUint16(packet[4:], uint16(len(packet)-ipHeader))
+		src := netip.MustParseAddr("fd00:6376:706e::2").As16()
+		copy(packet[8:24], src[:])
+		copy(packet[24:40], dest.Address.IP())
+	} else {
+		packet[0], packet[8], packet[9] = 0x45, 64, 6
+		binary.BigEndian.PutUint16(packet[2:], uint16(len(packet)))
+		copy(packet[12:16], []byte{198, 18, 0, 2})
+		copy(packet[16:20], dest.Address.IP())
+		binary.BigEndian.PutUint16(packet[10:], packetChecksum(packet[:20], 0))
+	}
+	tcp := packet[ipHeader:]
+	binary.BigEndian.PutUint16(tcp, port)
+	binary.BigEndian.PutUint16(tcp[2:], uint16(dest.Port))
+	binary.BigEndian.PutUint32(tcp[4:], seq)
+	binary.BigEndian.PutUint32(tcp[8:], ack)
+	tcp[12], tcp[13] = 0x50, flags
+	binary.BigEndian.PutUint16(tcp[14:], 65535)
+	copy(tcp[20:], payload)
+	binary.BigEndian.PutUint16(tcp[16:], packetChecksum(packet[addressAt:], uint32(len(tcp))+6))
 	return packet
 }
 

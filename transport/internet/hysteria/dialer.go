@@ -380,6 +380,7 @@ type dialerConf struct {
 
 type clientManager struct {
 	sync.RWMutex
+	startOnce  sync.Once
 	m          map[dialerConf]*client
 	path       context.Context
 	cancelPath context.CancelFunc
@@ -417,12 +418,12 @@ func (m *clientManager) clean() {
 }
 
 var (
-	manager     = newClientManager(runtime.GOOS == "ios" || runtime.GOOS == "android")
-	initmanager sync.Once
+	standardManager = newClientManager(false)
+	mobileManager   = newClientManager(true)
 )
 
 // ResetMobileNetwork cancels authentication and retires the old QUIC pool.
-func ResetMobileNetwork() { manager.resetNetwork() }
+func ResetMobileNetwork() { mobileManager.resetNetwork() }
 
 func (m *clientManager) resetNetwork() {
 	m.Lock()
@@ -445,7 +446,12 @@ func (m *clientManager) resetNetwork() {
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
-	return manager.dial(ctx, dest, streamSettings)
+	m := standardManager
+	if internet.UsesMobileProfile(ctx) {
+		m = mobileManager
+	}
+	m.startOnce.Do(func() { go m.clean() })
+	return m.dial(ctx, dest, streamSettings)
 }
 
 func (m *clientManager) dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
@@ -459,10 +465,6 @@ func (m *clientManager) dial(ctx context.Context, dest net.Destination, streamSe
 
 	datagram := DatagramFromContext(ctx)
 	dest.Network = net.Network_UDP
-
-	if m == manager {
-		initmanager.Do(func() { go m.clean() })
-	}
 
 	dialerConfKey := dialerConf{dest, streamSettings}
 
