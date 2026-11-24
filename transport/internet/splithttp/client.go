@@ -8,6 +8,7 @@ import (
 	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/apernet/quic-go/http3"
 	"github.com/xtls/xray-core/common"
@@ -34,6 +35,7 @@ type DefaultDialerClient struct {
 	client          *http.Client
 	closed          atomic.Bool
 	httpVersion     string
+	packetHTTP1     *http.Client
 	// pool of net.Conn, created using dialUploadConn
 	uploadRawPool  *sync.Pool
 	dialUploadConn func(ctxInner context.Context) (net.Conn, error)
@@ -43,16 +45,20 @@ func (c *DefaultDialerClient) IsClosed() bool {
 	return c.closed.Load()
 }
 
-func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
-	// this is done when the TCP/UDP connection to the server was established,
-	// and we can unblock the Dial function and print correct net addresses in
-	// logs
-	gotConn := done.New()
-	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (io.ReadCloser, net.Addr, net.Addr, error) {
+	type dialResult struct {
+		remote, local net.Addr
+		err           error
+	}
+	ready := make(chan dialResult, 1)
+	var announce sync.Once
+	emit := func(r dialResult) { announce.Do(func() { ready <- r }) }
+	requestCtx, cancel := context.WithCancel(ctx)
+	requestCtx = httptrace.WithClientTrace(requestCtx, &httptrace.ClientTrace{
 		GotConn: func(connInfo httptrace.GotConnInfo) {
-			remoteAddr = connInfo.Conn.RemoteAddr()
-			localAddr = connInfo.Conn.LocalAddr()
-			gotConn.Close()
+			if connInfo.Conn != nil {
+				emit(dialResult{remote: connInfo.Conn.RemoteAddr(), local: connInfo.Conn.LocalAddr()})
+			}
 		},
 	})
 
@@ -60,66 +66,91 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 	if body != nil {
 		method = c.transportConfig.GetNormalizedUplinkHTTPMethod() // stream-up/one
 	}
-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, body)
+	req, err := http.NewRequestWithContext(requestCtx, method, url, body)
 	if err != nil {
+		cancel()
 		errors.LogInfoInner(ctx, err, "failed to create HTTP request for "+url)
 		return nil, nil, nil, err
 	}
 	c.transportConfig.FillStreamRequest(req, sessionId, "")
 
-	wrc = &WaitReadCloser{wait: done.New()}
+	wrc := &WaitReadCloser{wait: done.New(), cancel: cancel}
 	go func() {
 		resp, err := c.client.Do(req)
 		if err != nil {
-			if !uploadOnly { // stream-down is enough
+			if !uploadOnly && requestCtx.Err() == nil {
 				c.closed.Store(true)
 				errors.LogInfoInner(ctx, err, "failed to "+method+" "+url)
 			}
-			gotConn.Close()
+			emit(dialResult{err: err})
 			common.Close(body)
 			wrc.Close()
 			return
 		}
+		emit(dialResult{}) // Some RoundTrippers do not emit GotConn.
 		if resp.StatusCode != 200 && !uploadOnly {
 			errors.LogInfo(ctx, "unexpected status ", resp.StatusCode)
 		}
 		if resp.StatusCode != 200 || uploadOnly { // stream-up
-			io.Copy(io.Discard, resp.Body)
+			if uploadOnly {
+				io.Copy(io.Discard, resp.Body)
+			}
 			resp.Body.Close() // if it is called immediately, the upload will be interrupted also
 			common.Close(body)
 			wrc.Close()
 			return
 		}
-		wrc.(*WaitReadCloser).Set(resp.Body)
+		wrc.Set(resp.Body)
 	}()
 
-	<-gotConn.Wait()
-	return
+	timer := time.NewTimer(12 * time.Second)
+	defer timer.Stop()
+	select {
+	case r := <-ready:
+		if r.err != nil {
+			wrc.Close()
+			return nil, nil, nil, r.err
+		}
+		return wrc, r.remote, r.local, nil
+	case <-ctx.Done():
+		wrc.Close()
+		return nil, nil, nil, ctx.Err()
+	case <-timer.C:
+		wrc.Close()
+		return nil, nil, nil, context.DeadlineExceeded
+	}
 }
 
 func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessionId string, seqStr string, payload buf.MultiBuffer) error {
 	method := c.transportConfig.GetNormalizedUplinkHTTPMethod()
-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, nil)
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		buf.ReleaseMulti(payload)
 		return err
 	}
 
-	if c.httpVersion != "1.1" {
+	if c.httpVersion != "1.1" || c.packetHTTP1 != nil {
 		c.transportConfig.FillPacketRequest(req, sessionId, seqStr, payload)
-		resp, err := c.client.Do(req)
+		client := c.client
+		if c.packetHTTP1 != nil {
+			client = c.packetHTTP1
+		}
+		resp, err := client.Do(req)
 		if err != nil {
-			c.closed.Store(true)
+			if ctx.Err() == nil {
+				c.closed.Store(true)
+			}
 			common.Close(req.Body)
 			return err
 		}
 
-		io.Copy(io.Discard, resp.Body)
 		defer resp.Body.Close()
 
 		if resp.StatusCode != 200 {
 			return errors.New("bad status code:", resp.Status)
 		}
+		_, err = io.Copy(io.Discard, resp.Body)
+		return err
 	} else {
 		replayBody := c.prepareHTTP1PacketRequest(req, sessionId, seqStr, payload)
 		if replayBody {
@@ -133,7 +164,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 			uploadConn = c.uploadRawPool.Get()
 			newConnection := uploadConn == nil
 			if newConnection {
-				newConn, err := c.dialUploadConn(context.WithoutCancel(ctx))
+				newConn, err := c.dialUploadConn(ctx)
 				if err != nil {
 					return err
 				}
@@ -141,18 +172,31 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 				uploadConn = h1UploadConn
 			} else {
 				h1UploadConn = uploadConn.(*H1Conn)
-
+			}
+			if deadline, ok := ctx.Deadline(); ok {
+				h1UploadConn.SetDeadline(deadline)
+			}
+			if !newConnection {
 				// TODO: Replace 0 here with a config value later
 				// Or add some other condition for optimization purposes
 				if h1UploadConn.UnreadedResponsesCount > 0 {
+					stop := context.AfterFunc(ctx, func() { h1UploadConn.Close() })
 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
 					if err != nil {
-						c.closed.Store(true)
+						stop()
+						if ctx.Err() == nil {
+							c.closed.Store(true)
+						}
 						h1UploadConn.Close()
 						return fmt.Errorf("error while reading response: %s", err.Error())
 					}
-					io.Copy(io.Discard, resp.Body)
+					_, err = io.Copy(io.Discard, resp.Body)
 					resp.Body.Close()
+					stop()
+					if err != nil {
+						h1UploadConn.Close()
+						return err
+					}
 					h1UploadConn.UnreadedResponsesCount--
 					if resp.StatusCode != 200 {
 						h1UploadConn.Close()
@@ -164,7 +208,12 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 			if replayBody {
 				req.Body = &replayMultiBufferBody{payload: payload}
 			}
+			stop := context.AfterFunc(ctx, func() { h1UploadConn.Close() })
 			err := req.Write(h1UploadConn)
+			if !stop() || ctx.Err() != nil {
+				h1UploadConn.Close()
+				return ctx.Err()
+			}
 			req.Body = nil
 			// if the write failed, we try another connection from
 			// the pool, until the write on a new connection fails.
@@ -172,8 +221,10 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 			// the connection has been closed in the meantime.
 			if err == nil {
 				h1UploadConn.UnreadedResponsesCount++
+				h1UploadConn.SetDeadline(time.Time{})
 				break
 			} else if newConnection {
+				h1UploadConn.Close()
 				return err
 			} else {
 				h1UploadConn.Close()
@@ -236,6 +287,10 @@ func (b *replayMultiBufferBody) Close() error {
 // HTTP/1.1 and HTTP/2 will close itself, we only handle HTTP/3 here
 func (c *DefaultDialerClient) Close() error {
 	transport := c.client.Transport
+	c.client.CloseIdleConnections()
+	if c.packetHTTP1 != nil {
+		c.packetHTTP1.CloseIdleConnections()
+	}
 	if h3Transport, ok := transport.(*http3.Transport); ok {
 		h3Transport.Close()
 	}
@@ -244,6 +299,7 @@ func (c *DefaultDialerClient) Close() error {
 
 type WaitReadCloser struct {
 	wait   *done.Instance
+	cancel context.CancelFunc
 	reader atomic.Pointer[io.ReadCloser]
 }
 
@@ -269,6 +325,9 @@ func (w *WaitReadCloser) Read(b []byte) (int, error) {
 }
 
 func (w *WaitReadCloser) Close() error {
+	if w.cancel != nil {
+		w.cancel()
+	}
 	w.wait.Close()
 	if p := w.reader.Swap(nil); p != nil {
 		return (*p).Close()

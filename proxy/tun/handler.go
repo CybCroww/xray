@@ -32,6 +32,7 @@ type Handler struct {
 	config          *Config
 	stack           Stack
 	tun             Tun
+	hostDevice      Tun
 	policyManager   policy.Manager
 	dispatcher      routing.Dispatcher
 	tag             string
@@ -91,6 +92,7 @@ var _ common.Runnable = (*Handler)(nil)
 
 // Init the Handler instance with necessary parameters
 func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routing.Dispatcher) error {
+	t.hostDevice, _ = ctx.Value(deviceKey{}).(Tun)
 	// Retrieve tag and sniffing config from context (set by AlwaysOnInboundHandler)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		t.tag = inbound.Tag
@@ -125,12 +127,16 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 
 func (t *Handler) Start() error {
 	tunName := t.config.Name
-	tunInterface, err := NewTun(t.config)
-	if err != nil {
-		return err
+	tunInterface := t.hostDevice
+	if tunInterface == nil {
+		var err error
+		tunInterface, err = NewTun(t.config)
+		if err != nil {
+			return err
+		}
 	}
 
-	if t.config.AutoOutboundsInterface != "" {
+	if t.hostDevice == nil && t.config.AutoOutboundsInterface != "" {
 		tunIndex, err := tunInterface.Index()
 		if err != nil {
 			_ = tunInterface.Close()
@@ -172,6 +178,7 @@ func (t *Handler) Start() error {
 		Tun:         tunInterface,
 		MTU:         t.config.MTU,
 		IdleTimeout: t.policyManager.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle,
+		LowMemory:   t.hostDevice != nil,
 	}
 	tunStack, err := NewStack(t.ctx, tunStackOptions, t)
 	if err != nil {

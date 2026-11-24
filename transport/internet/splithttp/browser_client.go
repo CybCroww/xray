@@ -46,6 +46,7 @@ func (c *BrowserDialerClient) PostPacket(ctx context.Context, url string, sessio
 	method := c.transportConfig.GetNormalizedUplinkHTTPMethod()
 	request, err := http.NewRequest(method, url, nil)
 	if err != nil {
+		buf.ReleaseMulti(payload)
 		return err
 	}
 

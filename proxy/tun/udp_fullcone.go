@@ -17,7 +17,9 @@ type udpConnectionHandler struct {
 
 	udpConns map[net.Destination]*udpConn
 	// closed is set by closeAll; a packet that arrives after it opens no flow
-	closed bool
+	closed     bool
+	maxFlows   int
+	queueLimit int
 
 	handleConnection func(conn net.Conn, dest net.Destination)
 	writePacket      func(data []byte, src net.Destination, dst net.Destination) error
@@ -28,6 +30,7 @@ func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Desti
 		udpConns:         make(map[net.Destination]*udpConn),
 		handleConnection: handleConnection,
 		writePacket:      writePacket,
+		queueLimit:       udpQueueLimit,
 	}
 
 	return handler
@@ -59,7 +62,11 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 	conn, found = u.udpConns[src]
 	if !found {
-		conn = &udpConn{handler: u, queue: newPacketQueue(udpQueueLimit), src: src, dst: dst}
+		if u.maxFlows > 0 && len(u.udpConns) >= u.maxFlows {
+			data.Release()
+			return
+		}
+		conn = &udpConn{handler: u, queue: newPacketQueue(u.queueLimit), src: src, dst: dst}
 		u.udpConns[src] = conn
 
 		go u.handleConnection(conn, dst)

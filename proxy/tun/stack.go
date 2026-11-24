@@ -37,6 +37,8 @@ type StackOptions struct {
 	Tun         Tun
 	MTU         uint32
 	IdleTimeout time.Duration
+	// LowMemory is for an embedded mobile packet flow with a small process budget.
+	LowMemory bool
 	// Addresses are what the stack opens connections from
 	Addresses []netip.Addr
 	// Remote is set if the tun is a tunnel to another system and not the tun of this one: what comes through it
@@ -62,6 +64,7 @@ type stack struct {
 	segmenter segmenter
 	// window is the window of every connection
 	window int32
+	maxTCP int
 	// verify is set if the checksums of what comes are looked at
 	verify bool
 	// stamps is set if connections carry the times of RFC 7323 when the other side does
@@ -111,12 +114,20 @@ func NewStack(ctx context.Context, options StackOptions, handler ConnectionHandl
 	if options.Remote {
 		s.window = tcpLargeWindow
 	}
+	if options.LowMemory {
+		s.window = 64 << 10
+		s.maxTCP = 96
+	}
 	for i := range s.identification {
 		s.identification[i].Store(rand.Uint32())
 	}
 	if handler != nil {
 		s.handle = handler.HandleConnection
 		s.udp = newUdpConnectionHandler(s.handle, s.writeUDP)
+		if options.LowMemory {
+			s.udp.maxFlows = 64
+			s.udp.queueLimit = 16
+		}
 	}
 	return s, nil
 }
@@ -345,6 +356,11 @@ func (s *stack) handleTCP(p packet) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		return
+	}
+	if s.maxTCP > 0 && len(s.conns) >= s.maxTCP && s.conns[f] == nil {
+		s.mu.Unlock()
+		// Ignore this SYN so the system can retry if capacity becomes available.
 		return
 	}
 	s.conns[f] = c
