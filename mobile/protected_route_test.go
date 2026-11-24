@@ -73,6 +73,9 @@ func TestProtectedTunnelTrafficStaysOnVPN(t *testing.T) {
 		{"grpc-multi", "grpc", `,"grpcSettings":{"serviceName":"cvpn-test","multiMode":true}`, &grpc.Config{ServiceName: "cvpn-test"}, []string{"h2"}},
 		{"xhttp", "splithttp", `,"xhttpSettings":{"path":"/test/","mode":"packet-up"}`, &splithttp.Config{Path: "/test/", Mode: "packet-up"}, []string{"h2"}},
 		{"xhttp-h3", "splithttp", `,"xhttpSettings":{"path":"/test/","mode":"packet-up"}`, &splithttp.Config{Path: "/test/", Mode: "packet-up"}, []string{"h3"}},
+		{"xhttp-stream-one", "splithttp", `,"xhttpSettings":{"path":"/test/","mode":"stream-one"}`, &splithttp.Config{Path: "/test/", Mode: "stream-one"}, []string{"h2"}},
+		{"xhttp-stream-one-h3", "splithttp", `,"xhttpSettings":{"path":"/test/","mode":"stream-one"}`, &splithttp.Config{Path: "/test/", Mode: "stream-one"}, []string{"h3"}},
+		{"xhttp-stream-up", "splithttp", `,"xhttpSettings":{"path":"/test/","mode":"stream-up"}`, &splithttp.Config{Path: "/test/", Mode: "stream-up"}, []string{"h2"}},
 		{"xhttp-header", "splithttp", `,"xhttpSettings":{"path":"/test/","mode":"packet-up","uplinkHTTPMethod":"GET","sessionIDPlacement":"header","seqPlacement":"header","uplinkDataPlacement":"header","uplinkDataKey":"X-Payload"}`,
 			&splithttp.Config{Path: "/test/", Mode: "packet-up", UplinkHTTPMethod: "GET", SessionIDPlacement: "header", SeqPlacement: "header", UplinkDataPlacement: "header", UplinkDataKey: "X-Payload"}, []string{"h2"}},
 	}
@@ -177,7 +180,7 @@ func TestProtectedTunnelTrafficStaysOnVPN(t *testing.T) {
 					t.Fatalf("phase %d reused a socket from the previous path", phase)
 				}
 			}
-			if tc.network == "splithttp" {
+			if xhttp, ok := tc.config.(*splithttp.Config); ok && xhttp.Mode == "packet-up" {
 				requests, _, _ := splithttp.MobileUploadStats()
 				if requests <= tunnel.xhttpRequests {
 					t.Fatal("the embedded tunnel did not use mobile XHTTP limits")

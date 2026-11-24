@@ -80,9 +80,10 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 
 	wrc := &WaitReadCloser{wait: done.New(), cancel: cancel}
 	var headerTimer *time.Timer
-	if c.downlinkTimeout > 0 && body == nil {
+	if c.downlinkTimeout > 0 && !uploadOnly {
 		// GotConn allows the uplink to start before the downlink headers
-		// arrive. A shared HTTP connection can stay healthy while this request stalls.
+		// arrive, including when both share one request. The upload-only
+		// request may legitimately receive no headers until it finishes.
 		headerTimer = time.AfterFunc(c.downlinkTimeout, cancel)
 	}
 	go func() {

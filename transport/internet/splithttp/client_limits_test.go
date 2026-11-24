@@ -215,15 +215,18 @@ func TestMobilePathChangeClosesPendingTLS(t *testing.T) {
 	}
 }
 
-func TestMobileDownlinkHeaderDeadline(t *testing.T) {
+func TestMobileStreamHeaderDeadline(t *testing.T) {
 	const timeout = 200 * time.Millisecond
 	for _, tt := range []struct {
 		name   string
+		mode   string
 		status int
 	}{
-		{"timeout", 0},
-		{"rejected", http.StatusServiceUnavailable},
-		{"established", http.StatusOK},
+		{"downlink timeout", "packet-up", 0},
+		{"duplex timeout", "stream-one", 0},
+		{"rejected", "stream-one", http.StatusServiceUnavailable},
+		{"established", "stream-one", http.StatusOK},
+		{"upload may delay headers", "stream-up", http.StatusOK},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			flowCtx, cancel := context.WithCancel(context.Background())
@@ -232,8 +235,13 @@ func TestMobileDownlinkHeaderDeadline(t *testing.T) {
 			defer local.Close()
 			defer remote.Close()
 			respond := make(chan struct{})
+			var body io.Reader
+			if tt.mode != "packet-up" {
+				body = strings.NewReader("uplink data")
+			}
+			uploadOnly := tt.mode == "stream-up"
 			client := DefaultDialerClient{
-				transportConfig: &Config{Path: "/test", Mode: "packet-up"},
+				transportConfig: &Config{Path: "/test", Mode: tt.mode},
 				downlinkTimeout: timeout,
 				client: &http.Client{Transport: streamRoundTripper(func(r *http.Request) (*http.Response, error) {
 					httptrace.ContextClientTrace(r.Context()).GotConn(httptrace.GotConnInfo{Conn: local})
@@ -245,11 +253,20 @@ func TestMobileDownlinkHeaderDeadline(t *testing.T) {
 					}
 				})},
 			}
-			stream, _, _, err := client.OpenStream(flowCtx, "https://test.invalid/test/", "session", nil, false, cancel)
+			stream, _, _, err := client.OpenStream(flowCtx, "https://test.invalid/test/", "session", body, uploadOnly, cancel)
 			if err != nil {
 				t.Fatalf("could not open downlink before response headers: %v", err)
 			}
 			defer stream.Close()
+			if uploadOnly {
+				select {
+				case <-flowCtx.Done():
+					t.Fatal("upload-only stream required headers before the server could finish")
+				case <-time.After(2 * timeout):
+					close(respond)
+				}
+				return
+			}
 			if tt.status != 0 {
 				close(respond)
 			}
