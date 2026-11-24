@@ -68,8 +68,8 @@ const (
 	// is not counted), and one that never answered after it was sent again that many times, after twenty seconds
 	tcpGiveUpTicks    = 4 * tcpMinuteTicks
 	tcpSynRetransmits = 5
-	// ticks between the probes of a window that stays closed
-	tcpProbeTicks = 10
+	// A closed window needs a probe only if a window update was lost.
+	tcpWindowProbeInterval = time.Second
 	// tcpLinger is how long a closed connection waits for the system to close its side
 	tcpLinger = 30 * time.Second
 )
@@ -207,7 +207,11 @@ type tcpConn struct {
 	srtt, rttvar time.Duration
 
 	timer *time.Timer
-	armed bool
+	// The window probe has its own timer so it cannot delay ACKs or
+	// retransmissions when the window reopens.
+	windowProbeTimer *time.Timer
+	windowProbeArmed bool
+	armed            bool
 	// stalled counts ticks without an acknowledgment of what waits for one
 	stalled, retransmitTicks, retransmits int
 	// lostTicks counts the ticks since the timer sent again the first time since something was acknowledged
@@ -614,6 +618,9 @@ func (c *tcpConn) acknowledge(s segment) {
 		c.resend()
 	}
 	c.sndWnd = window
+	if c.windowProbeArmed && window != 0 && c.windowProbeTimer.Stop() {
+		c.windowProbeArmed = false
+	}
 	// the writer goes on when it can write a good part of the window, not for every segment that is acknowledged.
 	// Unless the way to the system is what holds it back: that takes what the acknowledgments say has left it,
 	// and what is sent as they come does not come to it all at once
@@ -622,8 +629,14 @@ func (c *tcpConn) acknowledge(s segment) {
 	if c.cwnd < limit {
 		enough = uint32(c.mss)
 	}
-	if c.blocked && (c.sndUna == c.sndNxt || c.space() >= enough) {
-		c.writable.Broadcast()
+	if c.blocked {
+		if c.sndWnd == 0 {
+			if c.sndUna == c.sndNxt {
+				c.armWindowProbe()
+			}
+		} else if c.sndUna == c.sndNxt || c.space() >= enough {
+			c.writable.Broadcast()
+		}
 	}
 }
 
@@ -1022,12 +1035,6 @@ func (c *tcpConn) tick() {
 			}
 		}
 		c.arm(tcpTick)
-	case c.blocked:
-		// the segment that opens the window may have been lost, this one is answered with the window
-		if c.stalled++; c.stalled%tcpProbeTicks == 0 {
-			c.send(c.sndUna-1, tcpAck, nil, nil)
-		}
-		c.arm(tcpTick)
 	case c.closed:
 		if c.lingered {
 			c.reset()
@@ -1035,6 +1042,29 @@ func (c *tcpConn) tick() {
 		}
 		c.lingered = true
 		c.arm(tcpLinger)
+	}
+}
+
+// armWindowProbe schedules the next probe without polling. c.mu is held.
+func (c *tcpConn) armWindowProbe() {
+	if c.windowProbeArmed {
+		return
+	}
+	c.windowProbeArmed = true
+	if c.windowProbeTimer == nil {
+		c.windowProbeTimer = time.AfterFunc(tcpWindowProbeInterval, c.probeWindow)
+	} else {
+		c.windowProbeTimer.Reset(tcpWindowProbeInterval)
+	}
+}
+
+func (c *tcpConn) probeWindow() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.windowProbeArmed = false
+	if c.err == nil && c.blocked && c.sndWnd == 0 && c.sndUna == c.sndNxt {
+		c.send(c.sndUna-1, tcpAck, nil, nil)
+		c.armWindowProbe()
 	}
 }
 
@@ -1053,6 +1083,9 @@ func (c *tcpConn) abort(err error) {
 	c.err = err
 	if c.timer != nil {
 		c.timer.Stop()
+	}
+	if c.windowProbeTimer != nil {
+		c.windowProbeTimer.Stop()
 	}
 	if c.opened != nil {
 		close(c.opened)
@@ -1160,7 +1193,9 @@ func (c *tcpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				break
 			}
 			c.blocked = true
-			c.arm(tcpTick)
+			if c.sndWnd == 0 && c.sndUna == c.sndNxt {
+				c.armWindowProbe()
+			}
 			c.writable.Wait()
 			c.blocked = false
 		}

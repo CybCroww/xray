@@ -1013,6 +1013,69 @@ func TestTCPWindow(t *testing.T) {
 	p.silent(tcpTick + tcpTick/2)
 }
 
+func TestTCPZeroWindowDoesNotPollOrDelayOtherTimers(t *testing.T) {
+	conns := make(chan accepted, 1)
+	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
+	newTestStack(t, l, accept(conns))
+	p.window = 0
+	p.connect(nil)
+	conn := take(t, conns).conn.(*tcpConn)
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte("out"))
+		done <- err
+	}()
+
+	// The peer can still send even when it does not have room to read. Its
+	// data needs a normal delayed ACK while the write waits for a probe.
+	p.send(p.seq, tcpAck, nil, []byte("in"))
+	p.seq += 2
+	select {
+	case packet := <-p.sent:
+		ack := p.segment(packet)
+		if ack.seq != p.ack || ack.ack != p.seq || ack.flags != tcpAck || len(ack.payload) != 0 {
+			t.Fatalf("expected a delayed ACK with no probe, got %+v", ack)
+		}
+	case <-time.After(7 * tcpTick):
+		t.Fatal("zero-window timer delayed the ACK for incoming data")
+	}
+
+	probe := p.receive()
+	if probe.seq != p.ack-1 || probe.ack != p.seq || probe.flags != tcpAck || len(probe.payload) != 0 {
+		t.Fatalf("expected a window probe, got %+v", probe)
+	}
+	conn.mu.Lock()
+	polling, stalled := conn.armed, conn.stalled
+	conn.mu.Unlock()
+	if polling || stalled != 0 {
+		t.Fatalf("zero-window state still polls: armed=%t, retransmit ticks=%d", polling, stalled)
+	}
+
+	p.window = 1024
+	p.send(p.seq, tcpAck, nil, nil)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(7 * tcpTick):
+		t.Fatal("write did not resume on the window update")
+	}
+	if sent := p.receive(); sent.seq != p.ack || string(sent.payload) != "out" {
+		t.Fatalf("wrong payload after window update: %+v", sent)
+	}
+	// Withhold the ACK to verify the ordinary retransmission timer resumed.
+	select {
+	case packet := <-p.sent:
+		retry := p.segment(packet)
+		if retry.seq != p.ack || string(retry.payload) != "out" {
+			t.Fatalf("expected a retransmission, got %+v", retry)
+		}
+	case <-time.After(9 * tcpTick):
+		t.Fatal("retransmission still waiting on the probe timer")
+	}
+}
+
 func TestTCPWriteReleasesAcknowledgedBuffersWhileBlocked(t *testing.T) {
 	conns := make(chan accepted, 1)
 	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
