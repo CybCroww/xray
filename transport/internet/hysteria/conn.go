@@ -123,6 +123,7 @@ type InterConn struct {
 
 	id       uint32
 	ch       chan []byte
+	budget   *datagramReceiveBudget
 	lastSeen atomic.Int64
 	closed   atomic.Bool
 
@@ -146,8 +147,12 @@ func (c *InterConn) Update() {
 func (c *InterConn) Read(p []byte) (int, error) {
 	b, ok := <-c.ch
 	if ok {
+		n := copy(p, b)
+		if c.budget != nil {
+			c.budget.release(b)
+		}
 		c.Update()
-		return copy(p, b), nil
+		return n, nil
 	}
 	return 0, io.EOF
 }
@@ -196,6 +201,7 @@ type udpSessionManager struct {
 	m      map[uint32]*InterConn
 	next   uint32
 	closed bool
+	budget *datagramReceiveBudget
 
 	addConn        internet.ConnHandler
 	udpIdleTimeout time.Duration
@@ -206,6 +212,11 @@ func (m *udpSessionManager) close(udpConn *InterConn) {
 	if !udpConn.closed.Swap(true) {
 		close(udpConn.ch)
 		delete(m.m, udpConn.id)
+		if udpConn.budget != nil {
+			for packet := range udpConn.ch {
+				udpConn.budget.release(packet)
+			}
+		}
 	}
 }
 
@@ -275,12 +286,20 @@ func (m *udpSessionManager) udp() (*InterConn, error) {
 		return nil, errors.New("closed")
 	}
 
-	udpConn := &InterConn{
-		local:  m.conn.LocalAddr(),
-		remote: m.conn.RemoteAddr(),
+	udpConn := m.newUDPConn(m.next)
+	m.m[m.next] = udpConn
+	m.next++
+	return udpConn, nil
+}
 
-		id: m.next,
-		ch: make(chan []byte, udpMessageChanSize),
+func (m *udpSessionManager) newUDPConn(id uint32) *InterConn {
+	size := udpMessageChanSize
+	if m.budget != nil {
+		size = mobileDatagramsPerFlow
+	}
+	udpConn := &InterConn{
+		local: m.conn.LocalAddr(), remote: m.conn.RemoteAddr(), user: m.user,
+		id: id, ch: make(chan []byte, size), budget: m.budget,
 	}
 	udpConn.Update()
 	udpConn.write = m.conn.SendDatagram
@@ -289,20 +308,14 @@ func (m *udpSessionManager) udp() (*InterConn, error) {
 		m.close(udpConn)
 		m.Unlock()
 	}
-	m.m[m.next] = udpConn
-	m.next++
-
-	return udpConn, nil
+	return udpConn
 }
 
 func (m *udpSessionManager) feed(id uint32, d []byte) {
 	m.RLock()
 	udpConn, ok := m.m[id]
 	if ok {
-		select {
-		case udpConn.ch <- d:
-		default:
-		}
+		udpConn.enqueue(d)
 		m.RUnlock()
 		return
 	}
@@ -317,27 +330,10 @@ func (m *udpSessionManager) feed(id uint32, d []byte) {
 
 	udpConn, ok = m.m[id]
 	if !ok {
-		udpConn = &InterConn{
-			local:  m.conn.LocalAddr(),
-			remote: m.conn.RemoteAddr(),
-
-			id: id,
-			ch: make(chan []byte, udpMessageChanSize),
-		}
-		udpConn.Update()
-		udpConn.write = m.conn.SendDatagram
-		udpConn.close = func() {
-			m.Lock()
-			m.close(udpConn)
-			m.Unlock()
-		}
-		udpConn.user = m.user
+		udpConn = m.newUDPConn(id)
 		m.m[id] = udpConn
 		m.addConn(udpConn)
 	}
 
-	select {
-	case udpConn.ch <- d:
-	default:
-	}
+	udpConn.enqueue(d)
 }

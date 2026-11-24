@@ -239,6 +239,9 @@ func (c *client) dial(ctx context.Context) error {
 		m:    make(map[uint32]*InterConn),
 		next: 1,
 	}
+	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
+		c.udpSM.budget = &mobileDatagramReceive
+	}
 	go c.udpSM.run()
 
 	return nil

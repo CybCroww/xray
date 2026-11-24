@@ -47,6 +47,9 @@ method, session/payload placement, authentication, host and path. The smaller
 packet sizes reduce the maximum transfer rate at a given request interval, so
 measure throughput in addition to memory before changing these defaults.
 The mobile build uses smaller receive windows for gRPC, Hysteria and HTTP/3.
+Hysteria also limits its UDP delivery queues to 32 datagrams per flow and
+512 KiB across the process. Queue bytes and drops are available in the
+diagnostic snapshot.
 In gRPC multi-mode the decoder assembles protobuf fields into reusable 8 KiB
 buffers so small writes can share storage and large reads can release it in
 parts. The same gRPC servers and stream format work with this decoder.

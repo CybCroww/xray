@@ -44,6 +44,7 @@ type Tunnel struct {
 	xhttpRequests uint64
 	xhttpBytes    uint64
 	xhttpFailures uint64
+	hysteriaDrops uint64
 	lastTrim      atomic.Int64
 	stopped       atomic.Bool
 	resetFlows    func(bool)
@@ -90,6 +91,7 @@ func start(configJSON string, writer PacketWriter, mtu, memoryLimitMiB int, prot
 	limit := min(oldLimit, int64(memoryLimitMiB)<<20)
 	debug.SetMemoryLimit(limit)
 	requests, bytes, failures := splithttp.MobileUploadStats()
+	_, hysteriaDrops := hysteriatransport.MobileReceiveStats()
 	instance, err := startInstance(ctx, configJSON, mtu, protected)
 	if err != nil {
 		cancel()
@@ -99,7 +101,8 @@ func start(configJSON string, writer PacketWriter, mtu, memoryLimitMiB int, prot
 	}
 	tunnel := &Tunnel{
 		instance: instance, device: device, cancel: cancel, oldLimit: oldLimit, limit: limit,
-		xhttpRequests: requests, xhttpBytes: bytes, xhttpFailures: failures, resetFlows: resetFlows,
+		xhttpRequests: requests, xhttpBytes: bytes, xhttpFailures: failures, hysteriaDrops: hysteriaDrops,
+		resetFlows: resetFlows,
 	}
 	owner.tunnel = tunnel
 	return tunnel, nil
@@ -270,9 +273,11 @@ func (t *Tunnel) MemoryStatsJSON() string {
 	}
 	metrics.Read(s[:])
 	requests, bytes, failures := splithttp.MobileUploadStats()
+	hysteriaQueued, hysteriaDrops := hysteriatransport.MobileReceiveStats()
 	queued, offline := t.device.inputState()
-	return fmt.Sprintf(`{"goManagedBytes":%d,"goHeapBytes":%d,"goTargetBytes":%d,"goroutines":%d,"queuedPackets":%d,"networkOffline":%t,"inputCalls":%d,"droppedInputPackets":%d,"droppedOutputPackets":%d,"xhttpUploadRequests":%d,"xhttpUploadPayloadBytes":%d,"xhttpUploadFailures":%d,"networkChanges":%d}`,
+	return fmt.Sprintf(`{"goManagedBytes":%d,"goHeapBytes":%d,"goTargetBytes":%d,"goroutines":%d,"queuedPackets":%d,"networkOffline":%t,"inputCalls":%d,"droppedInputPackets":%d,"droppedOutputPackets":%d,"xhttpUploadRequests":%d,"xhttpUploadPayloadBytes":%d,"xhttpUploadFailures":%d,"hysteriaQueuedDatagramBytes":%d,"hysteriaDroppedDatagrams":%d,"networkChanges":%d}`,
 		s[0].Value.Uint64()-s[1].Value.Uint64(), s[2].Value.Uint64(), t.limit, s[3].Value.Uint64(),
 		queued, offline, t.device.inputCalls.Load(), t.device.inputDrops.Load(), t.device.outputDrops.Load(),
-		requests-t.xhttpRequests, bytes-t.xhttpBytes, failures-t.xhttpFailures, t.pathChanges.Load())
+		requests-t.xhttpRequests, bytes-t.xhttpBytes, failures-t.xhttpFailures,
+		hysteriaQueued, hysteriaDrops-t.hysteriaDrops, t.pathChanges.Load())
 }
