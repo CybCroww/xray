@@ -22,6 +22,8 @@ type udpConnectionHandler struct {
 	maxFlows   int
 	queueLimit int
 	queueBytes *udpQueueBudget
+	started    time.Time
+	recheckAt  time.Duration
 
 	handleConnection func(conn net.Conn, dest net.Destination)
 	writePacket      func(data []byte, src net.Destination, dst net.Destination) error
@@ -33,6 +35,7 @@ func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Desti
 		handleConnection: handleConnection,
 		writePacket:      writePacket,
 		queueLimit:       udpQueueLimit,
+		started:          time.Now(),
 	}
 
 	return handler
@@ -46,7 +49,7 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	u.RLock()
 	conn, found := u.udpConns[src]
 	if found {
-		if !conn.queue.push(data) {
+		if !conn.enqueue(data) {
 			errors.LogDebug(context.Background(), "drop udp with size ", data.Len(), " to ", dst.NetAddr(), " original ", conn.dst.NetAddr(), " > queue full")
 			data.Release()
 		}
@@ -64,13 +67,13 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 	conn, found = u.udpConns[src]
 	if !found {
-		if u.maxFlows > 0 && len(u.udpConns) >= u.maxFlows {
+		if u.maxFlows > 0 && len(u.udpConns) >= u.maxFlows && !u.reclaimIdle() {
 			data.Release()
 			return
 		}
 		conn = &udpConn{handler: u, queue: newPacketQueue(u.queueLimit), src: src, dst: dst}
 		conn.queue.budget = u.queueBytes
-		if !conn.queue.push(data) {
+		if !conn.enqueue(data) {
 			data.Release()
 			return
 		}
@@ -80,10 +83,36 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 
 	// queue the packet for the reader of the connection, or discard it
-	if !conn.queue.push(data) {
+	if !conn.enqueue(data) {
 		errors.LogDebug(context.Background(), "drop udp with size ", data.Len(), " to ", dst.NetAddr(), " original ", conn.dst.NetAddr(), " > queue full 2")
 		data.Release()
 	}
+}
+
+const mobileUDPIdleBeforeReuse = 30 * time.Second
+
+// reclaimIdle is called with the map locked and only under capacity pressure.
+// Recheck once the least recently used flow can be reclaimed. No periodic
+// timer is needed, and a stream still receiving replies counts as active.
+func (u *udpConnectionHandler) reclaimIdle() bool {
+	now := time.Since(u.started)
+	if u.queueBytes == nil || now < u.recheckAt {
+		return false
+	}
+	var oldest *udpConn
+	lastActive := now
+	for _, conn := range u.udpConns {
+		if used := time.Duration(conn.lastActive.Load()); oldest == nil || used < lastActive {
+			oldest, lastActive = conn, used
+		}
+	}
+	if now-lastActive < mobileUDPIdleBeforeReuse {
+		u.recheckAt = lastActive + mobileUDPIdleBeforeReuse
+		return false
+	}
+	delete(u.udpConns, oldest.src)
+	oldest.retire()
+	return true
 }
 
 // closeAll ends every UDP flow and takes no new ones: the readers get EOF, so the dispatch of each flow
@@ -101,9 +130,10 @@ func (u *udpConnectionHandler) reset(closing bool) {
 		conns = append(conns, c)
 	}
 	u.udpConns = make(map[net.Destination]*udpConn)
+	u.recheckAt = 0
 	u.Unlock()
 	for _, c := range conns {
-		c.queue.discard()
+		c.retire()
 	}
 }
 
@@ -129,7 +159,7 @@ func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 		if conn.queue.budget != nil {
 			// The dispatcher has finished. Release the shared budget even
 			// when no reader is left to drain its queue.
-			conn.queue.discard()
+			conn.retire()
 		} else {
 			conn.queue.close()
 		}
@@ -141,9 +171,36 @@ func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 type udpConn struct {
 	handler *udpConnectionHandler
 
-	queue *packetQueue
-	src   net.Destination
-	dst   net.Destination
+	queue      *packetQueue
+	src        net.Destination
+	dst        net.Destination
+	lastActive atomic.Int64
+	cancel     context.CancelFunc // protected by the handler while in its table
+}
+
+func (c *udpConn) enqueue(data *buf.Buffer) bool {
+	if c.queue.budget != nil {
+		c.lastActive.Store(time.Since(c.handler.started).Nanoseconds())
+	}
+	return c.queue.push(data)
+}
+
+func (c *udpConn) bindCancel(cancel context.CancelFunc) bool {
+	u := c.handler
+	u.Lock()
+	defer u.Unlock()
+	if u.udpConns[c.src] != c {
+		return false
+	}
+	c.cancel = cancel
+	return true
+}
+
+func (c *udpConn) retire() {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.queue.discard()
 }
 
 func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -206,6 +263,7 @@ func (c *udpConn) writeReply(payload []byte, from net.Destination) error {
 		if u.udpConns[c.src] != c {
 			return io.ErrClosedPipe
 		}
+		c.lastActive.Store(time.Since(u.started).Nanoseconds())
 	}
 	return u.writePacket(payload, from, c.src)
 }

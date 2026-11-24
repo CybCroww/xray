@@ -1,6 +1,7 @@
 package tun
 
 import (
+	"context"
 	"errors"
 	"io"
 	"testing"
@@ -173,6 +174,60 @@ func TestMobileUDPResetRejectsLateReplies(t *testing.T) {
 	}
 	if _, err := u.udpConns[src].Write([]byte("new response")); err != nil || writes != 1 {
 		t.Fatalf("want exactly one reply from the new flow, got %d, %v", writes, err)
+	}
+}
+
+func TestMobileUDPReusesIdleFlowAtCapacity(t *testing.T) {
+	for _, evictIdle := range []bool{false, true} {
+		name := "all flows active"
+		if evictIdle {
+			name = "oldest idle flow reclaimed"
+		}
+		t.Run(name, func(t *testing.T) {
+			const limit = 64
+			u := newUdpConnectionHandler(func(net.Conn, net.Destination) {}, func([]byte, net.Destination, net.Destination) error { return nil })
+			u.maxFlows, u.queueBytes = limit, new(udpQueueBudget)
+			defer u.closeAll()
+			source := func(i int) net.Destination {
+				return net.UDPDestination(net.ParseAddress("198.18.0.2"), net.Port(40000+i))
+			}
+			for i := range limit {
+				u.HandlePacket(source(i), net.UDPDestination(net.ParseAddress("192.0.2.1"), 443), buf.MergeBytes(nil, []byte("quic data"))[0])
+			}
+			oldest, receiving, otherIdle := u.udpConns[source(0)], u.udpConns[source(1)], u.udpConns[source(2)]
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if !oldest.bindCancel(cancel) {
+				t.Fatal("registered flow could not bind to its upstream context")
+			}
+			if evictIdle {
+				oldest.lastActive.Add(-int64(mobileUDPIdleBeforeReuse + 2*time.Second))
+				otherIdle.lastActive.Add(-int64(mobileUDPIdleBeforeReuse + time.Second))
+				receiving.lastActive.Add(-int64(mobileUDPIdleBeforeReuse + 3*time.Second))
+				if _, err := receiving.Write([]byte("reply")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			bytesBefore := u.queueBytes.retained.Load()
+			dns := net.UDPDestination(net.ParseAddress("192.0.2.53"), 53)
+			u.HandlePacket(source(limit), dns, buf.MergeBytes(nil, []byte("dns query"))[0])
+			if len(u.udpConns) != limit || u.queueBytes.retained.Load() != bytesBefore {
+				t.Fatal("UDP flow or queue budget changed at capacity")
+			}
+			if evictIdle {
+				if u.udpConns[source(limit)] == nil || u.udpConns[source(0)] != nil || ctx.Err() != context.Canceled {
+					t.Fatal("DNS did not replace the oldest idle upstream")
+				}
+				if oldest.bindCancel(func() { t.Error("retired upstream was bound again") }) {
+					t.Fatal("a late dispatch could still bind the retired flow")
+				}
+			} else if u.udpConns[source(limit)] != nil || u.udpConns[source(0)] != oldest || ctx.Err() != nil || u.recheckAt == 0 {
+				t.Fatal("a request at capacity disturbed an active flow or failed to defer the next scan")
+			}
+			if u.udpConns[source(1)] != receiving || u.udpConns[source(2)] != otherIdle {
+				t.Fatal("reclaim changed additional slots")
+			}
+		})
 	}
 }
 

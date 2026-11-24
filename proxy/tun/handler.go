@@ -264,6 +264,9 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if udp, ok := conn.(*udpConn); ok && udp.queue.budget != nil && !udp.bindCancel(cancel) {
+		return
+	}
 	ctx = c.ContextWithID(ctx, session.NewID())
 
 	source := net.DestinationFromAddr(conn.RemoteAddr())
