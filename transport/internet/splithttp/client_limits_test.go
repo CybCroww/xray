@@ -108,11 +108,67 @@ func TestMobilePacketUploadsBackpressureAndCancel(t *testing.T) {
 			t.Fatal("write stayed blocked after closing the tunnel")
 		}
 	}
-	first.Close()
-	second.Close()
+	// The old callers still own their connection objects. The new path must
+	// be able to start without waiting for either caller to close one.
 	retry, err := dial(ctx, destination, settings, limits)
 	if err != nil {
 		t.Fatalf("new path could not dial after canceling old sockets: %v", err)
+	}
+	retry.Close()
+}
+
+func TestMobilePacketUploadFailureReleasesFlow(t *testing.T) {
+	posted := make(chan struct{}, 1)
+	shutdown := make(chan struct{})
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			if _, err := io.Copy(io.Discard, r.Body); err != nil {
+				return
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			posted <- struct{}{}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-shutdown:
+		}
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+	defer close(shutdown)
+	destination, err := net.ParseDestination("tcp:" + strings.TrimPrefix(server.URL, "https://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := &internet.MemoryStreamConfig{
+		ProtocolName: "splithttp", SecurityType: "tls",
+		ProtocolSettings: &Config{Path: "/test", Mode: "packet-up"},
+		SecuritySettings: &tls.Config{PinnedPeerCertSha256: [][]byte{tls.GenerateCertHash(server.Certificate().Raw)}},
+	}
+	limits := &clientLimits{flows: make(chan struct{}, 1), packets: make(chan struct{}, 1)}
+	defer resetClientNetwork(limits)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	first, err := dial(ctx, destination, settings, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if _, err := first.Write([]byte("test packet")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-posted:
+	case <-ctx.Done():
+		t.Fatal("upload did not reach the server")
+	}
+	retry, err := dial(ctx, destination, settings, limits)
+	if err != nil {
+		t.Fatalf("could not dial on the same path after upload failed: %v", err)
 	}
 	retry.Close()
 }
@@ -161,7 +217,9 @@ func TestMobilePacketUploadKeepsHeaderTransport(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := dial(ctx, destination, settings, &clientLimits{flows: make(chan struct{}, 1), packets: make(chan struct{}, 4)})
+	dialCtx, cancelDial := context.WithCancel(ctx)
+	conn, err := dial(dialCtx, destination, settings, &clientLimits{flows: make(chan struct{}, 1), packets: make(chan struct{}, 4)})
+	cancelDial()
 	if err != nil {
 		t.Fatal(err)
 	}

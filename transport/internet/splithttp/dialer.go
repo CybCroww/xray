@@ -10,7 +10,6 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -395,20 +394,20 @@ func dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	defer func() {
 		if !returningConn {
 			conn.Close()
+		} else if limits != nil {
+			// After setup, a path change or upload failure must release this
+			// flow even if its caller has not closed the connection yet.
+			conn.stopContextClose = context.AfterFunc(connCtx, func() { conn.closeResources() })
 		}
 	}()
 	reader, writer := io.Pipe()
 	conn.writer = writer
-	var closed atomic.Bool
 	conn.onClose = func() {
-		if !closed.CompareAndSwap(false, true) {
-			return
-		}
+		cancel()
 		if stopPath != nil {
 			stopPath()
 			<-limits.flows
 		}
-		cancel()
 		reader.Close()
 		if xmuxClient != nil {
 			xmuxClient.DoneRunning()
