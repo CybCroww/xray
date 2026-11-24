@@ -12,7 +12,6 @@ import (
 
 const (
 	closeErrCodeOK            = 0x100 // HTTP3 ErrCodeNoError
-	closeErrCodeProtocolError = 0x101 // HTTP3 ErrCodeGeneralProtocolError
 	URLHost                   = "hysteria"
 	URLPath                   = "/auth"
 	RequestHeaderAuth         = "Hysteria-Auth"

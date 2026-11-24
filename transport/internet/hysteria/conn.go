@@ -267,7 +267,10 @@ func (m *udpSessionManager) run() {
 
 		m.feed(id, d)
 	}
+	m.closeAll()
+}
 
+func (m *udpSessionManager) closeAll() {
 	m.Lock()
 	defer m.Unlock()
 

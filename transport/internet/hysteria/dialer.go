@@ -30,6 +30,7 @@ import (
 
 type client struct {
 	lock         chan struct{}
+	path         context.Context // canceled when the mobile socket path is retired
 	instance     *core.Instance
 	forced       bool
 	dest         net.Destination
@@ -59,9 +60,18 @@ func (c *client) status() status {
 	}
 }
 
-func (c *client) close() {
+func (c *client) close(force bool) {
+	if c.udpSM != nil {
+		c.udpSM.closeAll()
+	}
+	if force {
+		// Wake the packet reader and any blocked writer on a retired path.
+		c.pktConn.Close()
+	}
 	c.conn.CloseWithError(closeErrCodeOK, "")
-	c.pktConn.Close()
+	if !force {
+		c.pktConn.Close()
+	}
 	c.tr.Close()
 	c.conn = nil
 	c.tr = nil
@@ -69,9 +79,16 @@ func (c *client) close() {
 	c.udpSM = nil
 }
 
+const mobileAuthTimeout = 12 * time.Second
+
 func (c *client) dial(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if c.path != nil {
+		if err := c.path.Err(); err != nil {
+			return err
+		}
 	}
 	if c.forced {
 		return errors.New("client is closed")
@@ -81,7 +98,14 @@ func (c *client) dial(ctx context.Context) error {
 	case StatusActive:
 		return nil
 	case StatusInactive:
-		c.close()
+		c.close(false)
+	}
+	if c.path != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, mobileAuthTimeout)
+		defer cancel()
+		stop := context.AfterFunc(c.path, cancel)
+		defer stop()
 	}
 
 	quicParams := c.quicParams
@@ -117,7 +141,7 @@ func (c *client) dial(ctx context.Context) error {
 	if quicParams.MaxConnReceiveWindow == 0 {
 		quicConfig.MaxConnectionReceiveWindow = 8388608 * 5 / 2
 	}
-	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
+	if c.path != nil {
 		if quicConfig.ChromeParrot {
 			quicConfig.OmitMaxDatagramFrameSize = false
 		}
@@ -176,6 +200,16 @@ func (c *client) dial(ctx context.Context) error {
 			return qc, nil
 		},
 	}
+	connected := false
+	defer func() {
+		if !connected {
+			// QUIC's transport shutdown waits for the packet reader. Close
+			// the socket first, including wrappers without read deadlines.
+			_ = pktConn.Close()
+			_ = rt.Close()
+			_ = tr.Close()
+		}
+	}()
 	req := &http.Request{
 		Method: http.MethodPost,
 		URL: &url.URL{
@@ -191,22 +225,23 @@ func (c *client) dial(ctx context.Context) error {
 	}
 	resp, err := rt.RoundTrip(req.WithContext(ctx))
 	if err != nil {
-		_ = rt.Close()
-		if conn != nil {
-			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		_ = tr.Close()
-		_ = pktConn.Close()
 		return err
 	}
 	_ = resp.Body.Close()
 
 	if resp.StatusCode != StatusAuthOK {
-		_ = rt.Close()
-		_ = conn.CloseWithError(closeErrCodeProtocolError, "")
-		_ = tr.Close()
-		_ = pktConn.Close()
 		return errors.New("auth failed code ", resp.StatusCode)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.path != nil {
+		if err := c.path.Err(); err != nil {
+			return err
+		}
 	}
 
 	// udp, _ := strconv.ParseBool(resp.Header.Get(ResponseHeaderUDPEnabled))
@@ -239,10 +274,11 @@ func (c *client) dial(ctx context.Context) error {
 		m:    make(map[uint32]*InterConn),
 		next: 1,
 	}
-	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
+	if c.path != nil {
 		c.udpSM.budget = &mobileDatagramReceive
 	}
 	go c.udpSM.run()
+	connected = true
 
 	return nil
 }
@@ -251,16 +287,27 @@ func (c *client) unlock() {
 	<-c.lock
 }
 
-func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
+func (c *client) acquire(ctx context.Context) error {
+	var pathDone <-chan struct{}
+	if c.path != nil {
+		pathDone = c.path.Done()
+	}
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return ctx.Err()
+	case <-pathDone:
+		return c.path.Err()
 	case c.lock <- struct{}{}:
-		defer c.unlock()
+		return nil
 	}
+}
 
-	err := c.dial(ctx)
-	if err != nil {
+func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
+	if err := c.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer c.unlock()
+	if err := c.dial(ctx); err != nil {
 		return nil, err
 	}
 
@@ -283,15 +330,11 @@ func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
 }
 
 func (c *client) udp(ctx context.Context) (stat.Connection, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case c.lock <- struct{}{}:
-		defer c.unlock()
+	if err := c.acquire(ctx); err != nil {
+		return nil, err
 	}
-
-	err := c.dial(ctx)
-	if err != nil {
+	defer c.unlock()
+	if err := c.dial(ctx); err != nil {
 		return nil, err
 	}
 
@@ -307,7 +350,7 @@ func (c *client) clean(force bool) {
 
 	status := c.status()
 	if status == StatusInactive || force && status != StatusNull {
-		c.close()
+		c.close(force)
 		return
 	}
 	if status != StatusActive {
@@ -322,7 +365,7 @@ func (c *client) clean(force bool) {
 	}
 	if udpSessions == 0 && (c.aliveTCP == nil || c.aliveTCP.Load() == 0) {
 		if time.Since(c.lastAlive) >= net.ConnIdleTimeout {
-			c.close()
+			c.close(false)
 			return
 		}
 	} else {
@@ -337,7 +380,17 @@ type dialerConf struct {
 
 type clientManager struct {
 	sync.RWMutex
-	m map[dialerConf]*client
+	m          map[dialerConf]*client
+	path       context.Context
+	cancelPath context.CancelFunc
+}
+
+func newClientManager(mobile bool) *clientManager {
+	m := &clientManager{m: make(map[dialerConf]*client)}
+	if mobile {
+		m.path, m.cancelPath = context.WithCancel(context.Background())
+	}
+	return m
 }
 
 func (m *clientManager) clean() {
@@ -364,20 +417,24 @@ func (m *clientManager) clean() {
 }
 
 var (
-	manager     = &clientManager{m: make(map[dialerConf]*client)}
+	manager     = newClientManager(runtime.GOOS == "ios" || runtime.GOOS == "android")
 	initmanager sync.Once
 )
 
-// ResetMobileNetwork detaches previous-path clients immediately. Cleanup of
-// their QUIC sessions can wait for I/O without blocking fresh dials.
-func ResetMobileNetwork() {
-	if runtime.GOOS != "ios" && runtime.GOOS != "android" {
+// ResetMobileNetwork cancels authentication and retires the old QUIC pool.
+func ResetMobileNetwork() { manager.resetNetwork() }
+
+func (m *clientManager) resetNetwork() {
+	m.Lock()
+	if m.cancelPath == nil {
+		m.Unlock()
 		return
 	}
-	manager.Lock()
-	old := manager.m
-	manager.m = make(map[dialerConf]*client)
-	manager.Unlock()
+	m.cancelPath()
+	m.path, m.cancelPath = context.WithCancel(context.Background())
+	old := m.m
+	m.m = make(map[dialerConf]*client)
+	m.Unlock()
 	if len(old) != 0 {
 		go func() {
 			for _, c := range old {
@@ -388,6 +445,10 @@ func ResetMobileNetwork() {
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
+	return manager.dial(ctx, dest, streamSettings)
+}
+
+func (m *clientManager) dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -399,26 +460,27 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	datagram := DatagramFromContext(ctx)
 	dest.Network = net.Network_UDP
 
-	initmanager.Do(func() {
-		go manager.clean()
-	})
+	if m == manager {
+		initmanager.Do(func() { go m.clean() })
+	}
 
 	dialerConfKey := dialerConf{dest, streamSettings}
 
-	manager.RLock()
-	c := manager.m[dialerConfKey]
-	manager.RUnlock()
+	m.RLock()
+	c := m.m[dialerConfKey]
+	m.RUnlock()
 
 	if c == nil {
-		manager.Lock()
+		m.Lock()
 		if err := ctx.Err(); err != nil {
-			manager.Unlock()
+			m.Unlock()
 			return nil, err
 		}
-		c = manager.m[dialerConfKey]
+		c = m.m[dialerConfKey]
 		if c == nil {
 			c = &client{
 				lock:         make(chan struct{}, 1),
+				path:         m.path,
 				instance:     core.FromContext(ctx),
 				dest:         dest,
 				config:       streamSettings.ProtocolSettings.(*Config),
@@ -427,9 +489,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 				finalMask:    streamSettings.FinalMask,
 				quicParams:   streamSettings.QuicParams,
 			}
-			manager.m[dialerConfKey] = c
+			m.m[dialerConfKey] = c
 		}
-		manager.Unlock()
+		m.Unlock()
 	}
 
 	if datagram {

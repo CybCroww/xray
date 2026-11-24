@@ -49,7 +49,9 @@ measure throughput in addition to memory before changing these defaults.
 The mobile build uses smaller receive windows for gRPC, Hysteria and HTTP/3.
 Hysteria also limits its UDP delivery queues to 32 datagrams per flow and
 512 KiB across the process. Queue bytes and drops are available in the
-diagnostic snapshot.
+diagnostic snapshot. Mobile Hysteria waits at most 12 seconds for the
+initial QUIC connection and HTTP/3 authentication together. A path change
+cancels this wait and releases the old socket and UDP queues.
 In gRPC multi-mode the decoder assembles protobuf fields into reusable 8 KiB
 buffers so small writes can share storage and large reads can release it in
 parts. The same gRPC servers and stream format work with this decoder.
