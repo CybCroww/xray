@@ -317,6 +317,9 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		uploadRawPool:  &sync.Pool{},
 		dialUploadConn: dialContext,
 	}
+	if mobile {
+		client.downlinkTimeout = 20 * time.Second
+	}
 	if httpVersion == "1.1" && mobile {
 		upload := transport.(*http.Transport).Clone()
 		upload.DisableKeepAlives = false
@@ -528,12 +531,16 @@ func dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		errors.LogInfo(ctx, fmt.Sprintf("XHTTP is downloading from %s, mode %s, HTTP version %s, host %s", dest2, "stream-down", httpVersion2, requestURL2.Host))
 	}
 
+	var cancelOnFailure context.CancelFunc
+	if limits != nil {
+		cancelOnFailure = cancel
+	}
 	if mode == "stream-one" {
 		requestURL.Path = transportConfiguration.GetNormalizedPath()
 		if xmuxClient != nil {
 			xmuxClient.LeftRequests.Add(-1)
 		}
-		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(connCtx, requestURL.String(), sessionId, reader, false)
+		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(connCtx, requestURL.String(), sessionId, reader, false, cancelOnFailure)
 		if err != nil {
 			return nil, err
 		}
@@ -543,7 +550,7 @@ func dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		if downloadClient != nil {
 			downloadClient.LeftRequests.Add(-1)
 		}
-		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient2.OpenStream(connCtx, requestURL2.String(), sessionId, nil, false)
+		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient2.OpenStream(connCtx, requestURL2.String(), sessionId, nil, false, cancelOnFailure)
 		if err != nil {
 			return nil, err
 		}
@@ -552,7 +559,7 @@ func dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		if xmuxClient != nil {
 			xmuxClient.LeftRequests.Add(-1)
 		}
-		_, _, _, err = httpClient.OpenStream(connCtx, requestURL.String(), sessionId, reader, true)
+		_, _, _, err = httpClient.OpenStream(connCtx, requestURL.String(), sessionId, reader, true, cancelOnFailure)
 		if err != nil {
 			return nil, err
 		}

@@ -22,8 +22,8 @@ import (
 type DialerClient interface {
 	IsClosed() bool
 
-	// ctx, url, sessionId, body, uploadOnly
-	OpenStream(context.Context, string, string, io.Reader, bool) (io.ReadCloser, net.Addr, net.Addr, error)
+	// ctx, url, sessionId, body, uploadOnly, cancelFlow
+	OpenStream(context.Context, string, string, io.Reader, bool, context.CancelFunc) (io.ReadCloser, net.Addr, net.Addr, error)
 
 	// ctx, url, sessionId, seqStr, body, contentLength
 	PostPacket(context.Context, string, string, string, buf.MultiBuffer) error
@@ -36,6 +36,7 @@ type DefaultDialerClient struct {
 	closed          atomic.Bool
 	httpVersion     string
 	packetHTTP1     *http.Client
+	downlinkTimeout time.Duration
 	// pool of net.Conn, created using dialUploadConn
 	uploadRawPool  *sync.Pool
 	dialUploadConn func(ctxInner context.Context) (net.Conn, error)
@@ -45,7 +46,7 @@ func (c *DefaultDialerClient) IsClosed() bool {
 	return c.closed.Load()
 }
 
-func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (io.ReadCloser, net.Addr, net.Addr, error) {
+func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool, cancelFlow context.CancelFunc) (io.ReadCloser, net.Addr, net.Addr, error) {
 	type dialResult struct {
 		remote, local net.Addr
 		err           error
@@ -75,14 +76,37 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 	c.transportConfig.FillStreamRequest(req, sessionId, "")
 
 	wrc := &WaitReadCloser{wait: done.New(), cancel: cancel}
+	var headerTimer *time.Timer
+	if c.downlinkTimeout > 0 && body == nil {
+		// GotConn allows the uplink to start before the downlink headers
+		// arrive. A shared HTTP connection can stay healthy while this request stalls.
+		headerTimer = time.AfterFunc(c.downlinkTimeout, cancel)
+	}
 	go func() {
 		resp, err := c.client.Do(req)
+		headersTimedOut := headerTimer != nil && !headerTimer.Stop()
+		transportFailed := err != nil && requestCtx.Err() == nil
+		responseReceived := err == nil
+		if headersTimedOut {
+			err = errors.New("XHTTP downlink response headers timed out").Base(context.DeadlineExceeded)
+		} else if err == nil && cancelFlow != nil && resp.StatusCode != http.StatusOK {
+			err = errors.New("unexpected status ", resp.StatusCode)
+		}
 		if err != nil {
-			if !uploadOnly && requestCtx.Err() == nil {
+			if !uploadOnly && transportFailed && !headersTimedOut {
 				c.closed.Store(true)
+			}
+			failed := requestCtx.Err() == nil || headersTimedOut
+			if !uploadOnly && failed {
 				errors.LogInfoInner(ctx, err, "failed to "+method+" "+url)
 			}
 			emit(dialResult{err: err})
+			if cancelFlow != nil && failed {
+				cancelFlow()
+			}
+			if responseReceived {
+				resp.Body.Close()
+			}
 			common.Close(body)
 			wrc.Close()
 			return

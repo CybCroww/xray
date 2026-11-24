@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/base64"
 	"io"
+	stdnet "net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
@@ -17,6 +19,72 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
+
+type streamRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f streamRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestMobileDownlinkHeaderDeadline(t *testing.T) {
+	const timeout = 200 * time.Millisecond
+	for _, tt := range []struct {
+		name   string
+		status int
+	}{
+		{"timeout", 0},
+		{"rejected", http.StatusServiceUnavailable},
+		{"established", http.StatusOK},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			flowCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			local, remote := stdnet.Pipe()
+			defer local.Close()
+			defer remote.Close()
+			respond := make(chan struct{})
+			client := DefaultDialerClient{
+				transportConfig: &Config{Path: "/test", Mode: "packet-up"},
+				downlinkTimeout: timeout,
+				client: &http.Client{Transport: streamRoundTripper(func(r *http.Request) (*http.Response, error) {
+					httptrace.ContextClientTrace(r.Context()).GotConn(httptrace.GotConnInfo{Conn: local})
+					select {
+					case <-r.Context().Done():
+						return nil, r.Context().Err()
+					case <-respond:
+						return &http.Response{StatusCode: tt.status, Body: io.NopCloser(strings.NewReader("payload"))}, nil
+					}
+				})},
+			}
+			stream, _, _, err := client.OpenStream(flowCtx, "https://test.invalid/test/", "session", nil, false, cancel)
+			if err != nil {
+				t.Fatalf("could not open downlink before response headers: %v", err)
+			}
+			defer stream.Close()
+			if tt.status != 0 {
+				close(respond)
+			}
+			if tt.status == http.StatusOK {
+				select {
+				case <-flowCtx.Done():
+					t.Fatal("the header timer canceled an established stream")
+				case <-time.After(2 * timeout):
+				}
+				data, err := io.ReadAll(stream)
+				if err != nil || string(data) != "payload" {
+					t.Fatalf("response did not survive past the header deadline: %q, %v", data, err)
+				}
+				return
+			}
+			select {
+			case <-flowCtx.Done():
+			case <-time.After(3 * time.Second):
+				t.Fatal("a failed downlink did not release the flow")
+			}
+			if client.IsClosed() {
+				t.Fatal("one failed downlink retired the shared client")
+			}
+		})
+	}
+}
 
 func TestMobilePacketUploadsBackpressureAndCancel(t *testing.T) {
 	const budget = 4

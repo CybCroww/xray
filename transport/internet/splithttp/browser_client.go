@@ -21,7 +21,7 @@ func (c *BrowserDialerClient) IsClosed() bool {
 	panic("not implemented yet")
 }
 
-func (c *BrowserDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (io.ReadCloser, net.Addr, net.Addr, error) {
+func (c *BrowserDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool, _ context.CancelFunc) (io.ReadCloser, net.Addr, net.Addr, error) {
 	if body != nil {
 		return nil, nil, nil, errors.New("bidirectional streaming for browser dialer not implemented yet")
 	}

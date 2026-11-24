@@ -19,7 +19,7 @@ type batchRecorder struct {
 
 func (*batchRecorder) IsClosed() bool { return false }
 
-func (*batchRecorder) OpenStream(context.Context, string, string, io.Reader, bool) (io.ReadCloser, net.Addr, net.Addr, error) {
+func (*batchRecorder) OpenStream(context.Context, string, string, io.Reader, bool, context.CancelFunc) (io.ReadCloser, net.Addr, net.Addr, error) {
 	panic("upload-only recorder")
 }
 
