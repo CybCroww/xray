@@ -16,6 +16,7 @@ import (
 
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
 	"github.com/xtls/xray-core/common/uuid"
@@ -24,11 +25,13 @@ import (
 	testtcp "github.com/xtls/xray-core/testing/servers/tcp"
 	testudp "github.com/xtls/xray-core/testing/servers/udp"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/browser_dialer"
 	"github.com/xtls/xray-core/transport/internet/grpc"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	wiretcp "github.com/xtls/xray-core/transport/internet/tcp"
 	"github.com/xtls/xray-core/transport/internet/tls"
+	wirews "github.com/xtls/xray-core/transport/internet/websocket"
 )
 
 type tunnelDialAudit struct {
@@ -63,12 +66,21 @@ func init() {
 }
 
 func TestProtectedTunnelTrafficStaysOnVPN(t *testing.T) {
+	// Even when the host has enabled its browser dialer, mobile flows must
+	// send TLS-protected traffic to the configured socket themselves.
+	t.Cleanup(browser_dialer.Reload)
+	t.Setenv(platform.BrowserDialerAddress, "127.0.0.1:0")
+	browser_dialer.Reload()
+	if !browser_dialer.HasBrowserDialer() {
+		t.Fatal("browser dialer fixture did not start")
+	}
 	transportCases := []struct {
 		name, network, jsonOptions string
 		config                     any
 		alpn                       []string
 	}{
 		{"raw", "tcp", "", &wiretcp.Config{}, nil},
+		{"websocket", "websocket", `,"wsSettings":{"path":"/test/"}`, &wirews.Config{Path: "/test/"}, []string{"http/1.1"}},
 		{"grpc", "grpc", `,"grpcSettings":{"serviceName":"cvpn-test"}`, &grpc.Config{ServiceName: "cvpn-test"}, []string{"h2"}},
 		{"grpc-multi", "grpc", `,"grpcSettings":{"serviceName":"cvpn-test","multiMode":true}`, &grpc.Config{ServiceName: "cvpn-test"}, []string{"h2"}},
 		{"xhttp", "splithttp", `,"xhttpSettings":{"path":"/test/","mode":"packet-up"}`, &splithttp.Config{Path: "/test/", Mode: "packet-up"}, []string{"h2"}},

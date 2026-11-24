@@ -30,6 +30,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"golang.org/x/net/http2"
 )
@@ -72,6 +73,7 @@ type UConn struct {
 	ServerName          string
 	AuthKey             []byte
 	Verified            bool
+	requireVerified     bool
 	suppressCloseNotify atomic.Bool
 }
 
@@ -125,6 +127,9 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 			}
 		}
 	}
+	if c.requireVerified {
+		return errors.New("REALITY: peer did not authenticate")
+	}
 	opts := x509.VerifyOptions{
 		DNSName:       c.ServerName,
 		Intermediates: x509.NewCertPool(),
@@ -138,10 +143,20 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 	return nil
 }
 
-func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
+func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (conn net.Conn, err error) {
+	mobile := internet.UsesMobileProfile(ctx)
+	if mobile {
+		// A failed handshake has no other owner on the mobile transport.
+		defer func() {
+			if err != nil {
+				c.Close()
+			}
+		}()
+	}
 	localAddr := c.LocalAddr().String()
 	uConn := &UConn{
-		Config: config,
+		Config:          config,
+		requireVerified: mobile,
 	}
 	utlsConfig := &utls.Config{
 		VerifyPeerCertificate:  uConn.VerifyPeerCertificate,

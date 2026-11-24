@@ -48,7 +48,7 @@ var (
 func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig, path context.Context) (DialerClient, *XmuxClient, error) {
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
-	if browser_dialer.HasBrowserDialer() && realityConfig == nil {
+	if path == nil && realityConfig == nil && browser_dialer.HasBrowserDialer() {
 		return &BrowserDialerClient{transportConfig: streamSettings.ProtocolSettings.(*Config)}, nil, nil
 	}
 
@@ -454,7 +454,7 @@ func dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if requestURL.Host == "" {
 		requestURL.Host = dest.Address.String()
 	}
-	if browser_dialer.HasBrowserDialer() && realityConfig == nil {
+	if limits == nil && realityConfig == nil && browser_dialer.HasBrowserDialer() {
 		// For Browser Dialer's optimized IP and non-standard port
 		if !(requestURL.Scheme == "http" && dest.Port == 80) && !(requestURL.Scheme == "https" && dest.Port == 443) {
 			requestURL.Host += ":" + dest.Port.String()
@@ -524,7 +524,7 @@ func dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		if requestURL2.Host == "" {
 			requestURL2.Host = dest2.Address.String()
 		}
-		if browser_dialer.HasBrowserDialer() && realityConfig2 == nil {
+		if limits == nil && realityConfig2 == nil && browser_dialer.HasBrowserDialer() {
 			// For Browser Dialer's optimized IP and non-standard port
 			if !(requestURL2.Scheme == "http" && dest2.Port == 80) && !(requestURL2.Scheme == "https" && dest2.Port == 443) {
 				requestURL2.Host += ":" + dest2.Port.String()

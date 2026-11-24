@@ -149,6 +149,7 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 	// stream's entire context and its connection objects.
 	sessionID := c.IDFromContext(ctx)
 	outbounds := session.OutboundsFromContext(ctx)
+	embedded := internet.UsesEmbeddedMobileProfile(ctx)
 	dialOptions := []grpc.DialOption{
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
@@ -182,6 +183,9 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 			gctx = c.ContextWithID(gctx, sessionID)
 			gctx = session.ContextWithOutbounds(gctx, outbounds)
 			gctx = session.ContextWithTimeoutOnly(gctx, true)
+			if embedded {
+				gctx = internet.ContextWithMobileProfile(gctx)
+			}
 
 			var c net.Conn
 			if streamSettings.FinalMask != nil {

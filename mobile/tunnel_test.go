@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/xtls/xray-core/infra/conf"
 )
 
 type capturePackets chan []byte
@@ -121,10 +123,11 @@ func TestProtectedProfileRejectsDirectFallbackAndUnresolvedTransport(t *testing.
 		return `{"log":{"loglevel":"none"},"inbounds":[{"protocol":"tun"}],"outbounds":[` + outbounds + `]}`
 	}
 	for name, invalid := range map[string]string{
-		"direct fallback":        config(proxy + `,{"tag":"direct","protocol":"freedom"}`),
-		"hostname":               config(strings.Replace(proxy, "192.0.2.1", "test.example", 1)),
-		"insecure TLS":           config(strings.Replace(proxy, `"serverName":`, `"allowInsecure":true,"serverName":`, 1)),
-		"download host in extra": config(strings.Replace(proxy, `"network":"xhttp",`, `"network":"xhttp","xhttpSettings":{"extra":{"downloadSettings":{"address":"test.example","network":"xhttp","security":"tls"}}},`, 1)),
+		"direct fallback":          config(proxy + `,{"tag":"direct","protocol":"freedom"}`),
+		"hostname":                 config(strings.Replace(proxy, "192.0.2.1", "test.example", 1)),
+		"insecure TLS":             config(strings.Replace(proxy, `"serverName":`, `"allowInsecure":true,"serverName":`, 1)),
+		"download host in extra":   config(strings.Replace(proxy, `"network":"xhttp",`, `"network":"xhttp","xhttpSettings":{"extra":{"downloadSettings":{"address":"test.example","network":"xhttp","security":"tls"}}},`, 1)),
+		"download wrong transport": config(strings.Replace(proxy, `"network":"xhttp",`, `"network":"xhttp","xhttpSettings":{"downloadSettings":{"address":"192.0.2.2","port":443,"network":"raw","security":"tls"}},`, 1)),
 	} {
 		t.Run(name, func(t *testing.T) {
 			tunnel, err := StartProtected(invalid, make(capturePackets, 1), 1280, 32)
@@ -143,6 +146,15 @@ func TestProtectedProfileRejectsDirectFallbackAndUnresolvedTransport(t *testing.
 	var stats struct{ NetworkChanges uint64 }
 	if err := json.Unmarshal([]byte(tunnel.MemoryStatsJSON()), &stats); err != nil || stats.NetworkChanges != 1 {
 		t.Fatalf("path change not delivered to running stack: %+v, %v", stats, err)
+	}
+}
+
+func TestProtectedProfileRejectsRealityKeyLogging(t *testing.T) {
+	stream := &conf.StreamConfig{
+		Security: "reality", REALITYSettings: &conf.REALITYConfig{MasterKeyLog: "example.log"},
+	}
+	if err := protectStream(stream, false); err == nil || !strings.Contains(err.Error(), "REALITY key logging") {
+		t.Fatalf("expected rejection of REALITY key logging, got %v", err)
 	}
 }
 

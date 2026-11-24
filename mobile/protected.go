@@ -91,20 +91,28 @@ func protectStream(stream *conf.StreamConfig, download bool) error {
 			return errors.New("protected profile needs a static ECH configuration")
 		}
 	}
+	if reality := stream.REALITYSettings; reality != nil && reality.MasterKeyLog != "" && reality.MasterKeyLog != "none" {
+		return errors.New("protected profile does not permit REALITY key logging")
+	}
 	method := stream.Network
 	if stream.Method != nil {
 		method = stream.Method
 	}
+	name := "tcp"
 	if method != nil {
-		name, err := method.Build()
+		var err error
+		name, err = method.Build()
 		if err != nil {
 			return err
 		}
-		switch name {
-		case "tcp", "grpc", "splithttp", "websocket", "hysteria":
-		default:
-			return errors.New("unsupported transport in protected profile")
-		}
+	}
+	if download && name != "splithttp" {
+		return errors.New("protected XHTTP download settings require the XHTTP transport")
+	}
+	switch name {
+	case "tcp", "grpc", "splithttp", "websocket", "hysteria":
+	default:
+		return errors.New("unsupported transport in protected profile")
 	}
 	if sock := stream.SocketSettings; sock != nil && (sock.DialerProxy != "" || sock.Interface != "" || len(sock.CustomSockopt) > 0) {
 		return errors.New("protected profile does not permit custom socket routing")

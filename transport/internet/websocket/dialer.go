@@ -92,10 +92,10 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
 		}
 	}
 
-	if browser_dialer.HasBrowserDialer() {
+	if !internet.UsesMobileProfile(ctx) && browser_dialer.HasBrowserDialer() {
 		// For Browser Dialer's optimized IP and non-standard port
 		host := wsSettings.Host
-		if host == "" && tConfig.ServerName != "" {
+		if host == "" && tConfig != nil {
 			host = tConfig.ServerName
 		}
 		if host == "" {
