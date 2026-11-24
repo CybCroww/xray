@@ -31,6 +31,11 @@ func TestNetworkResetRetiresSharedGRPCChannel(t *testing.T) {
 	if old.GetState() != connectivity.Shutdown {
 		t.Fatal("previous channel was not shut down")
 	}
+	staleCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if conn, err := getGrpcClient(staleCtx, destination, settings); conn != nil || err != context.Canceled {
+		t.Fatalf("canceled flow repopulated the channel pool: %v, %v", conn, err)
+	}
 	fresh, err := getGrpcClient(context.Background(), destination, settings)
 	if err != nil || fresh == old || fresh.GetState() == connectivity.Shutdown {
 		t.Fatalf("new channel failed: %v", err)

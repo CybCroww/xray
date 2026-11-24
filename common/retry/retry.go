@@ -1,6 +1,7 @@
 package retry // import "github.com/xtls/xray-core/common/retry"
 
 import (
+	"context"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -15,15 +16,18 @@ type Strategy interface {
 }
 
 type retryer struct {
+	ctx          context.Context
 	totalAttempt int
 	nextDelay    func() uint32
 }
 
 // On implements Strategy.On.
 func (r *retryer) On(method func() error) error {
-	attempt := 0
 	accumulatedError := make([]error, 0, r.totalAttempt)
-	for attempt < r.totalAttempt {
+	for attempt := range r.totalAttempt {
+		if r.ctx != nil && r.ctx.Err() != nil {
+			return r.ctx.Err()
+		}
 		err := method()
 		if err == nil {
 			return nil
@@ -32,9 +36,24 @@ func (r *retryer) On(method func() error) error {
 		if numErrors == 0 || err.Error() != accumulatedError[numErrors-1].Error() {
 			accumulatedError = append(accumulatedError, err)
 		}
-		delay := r.nextDelay()
-		time.Sleep(time.Duration(delay) * time.Millisecond)
-		attempt++
+		if r.ctx != nil && attempt+1 == r.totalAttempt {
+			break
+		}
+		delay := time.Duration(r.nextDelay()) * time.Millisecond
+		if r.ctx == nil {
+			time.Sleep(delay)
+		} else if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-r.ctx.Done():
+				timer.Stop()
+				return r.ctx.Err()
+			}
+		}
+	}
+	if r.ctx != nil && r.ctx.Err() != nil {
+		return r.ctx.Err()
 	}
 	return errors.New(accumulatedError).Base(ErrRetryFailed)
 }
@@ -50,8 +69,19 @@ func Timed(attempts int, delay uint32) Strategy {
 }
 
 func ExponentialBackoff(attempts int, delay uint32) Strategy {
+	return exponentialBackoff(nil, attempts, delay)
+}
+
+// ExponentialBackoffContext stops retrying when ctx is canceled and waits
+// only between attempts. The operation should use the same context.
+func ExponentialBackoffContext(ctx context.Context, attempts int, delay uint32) Strategy {
+	return exponentialBackoff(ctx, attempts, delay)
+}
+
+func exponentialBackoff(ctx context.Context, attempts int, delay uint32) Strategy {
 	nextDelay := uint32(0)
 	return &retryer{
+		ctx:          ctx,
 		totalAttempt: attempts,
 		nextDelay: func() uint32 {
 			r := nextDelay

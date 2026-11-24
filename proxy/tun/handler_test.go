@@ -11,6 +11,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
 )
@@ -184,6 +185,73 @@ func TestHandlerCountsTunConnectionTraffic(t *testing.T) {
 type blockingDispatcher struct {
 	testDispatcher
 	entered chan struct{}
+}
+
+type capturingDispatcher struct {
+	testDispatcher
+	started chan context.Context
+}
+
+func (d *capturingDispatcher) DispatchLink(ctx context.Context, _ xnet.Destination, _ *transport.Link) error {
+	d.started <- ctx
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestNetworkResetRetiresTransportsBeforeDispatch(t *testing.T) {
+	var reset func()
+	var retired bool
+	var previous context.Context
+	dispatcher := &capturingDispatcher{started: make(chan context.Context, 2)}
+	handler := &Handler{
+		config:        &Config{MTU: testMTU},
+		hostDevice:    newLink(),
+		dispatcher:    dispatcher,
+		policyManager: policy.DefaultManager{},
+		flowReset: flowReset{
+			register: func(run func()) { reset = run },
+		},
+	}
+	handler.flowReset.retireTransports = func() {
+		retired = true
+		if previous.Err() != context.Canceled {
+			t.Error("old flow was still live when transport pools began retiring")
+		}
+		if handler.flowMu.TryLock() {
+			handler.flowMu.Unlock()
+			t.Error("new flows could begin while transport pools were retiring")
+		}
+	}
+	handler.ctx, handler.cancel = context.WithCancel(context.Background())
+	handler.flowCtx, handler.cancelFlows = context.WithCancel(handler.ctx)
+	if err := handler.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer handler.Close()
+	if reset == nil {
+		t.Fatal("handler did not register a network reset")
+	}
+
+	dest := xnet.TCPDestination(xnet.LocalHostIP, 443)
+	go handler.HandleConnection(newTestConn(nil), dest)
+	select {
+	case previous = <-dispatcher.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first flow did not start")
+	}
+	reset()
+	if !retired {
+		t.Fatal("transport pools were not retired")
+	}
+	go handler.HandleConnection(newTestConn(nil), dest)
+	select {
+	case next := <-dispatcher.started:
+		if next.Err() != nil {
+			t.Fatalf("new flow failed after the reset: %v", next.Err())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("new flow did not start after the reset")
+	}
 }
 
 func (d *blockingDispatcher) DispatchLink(ctx context.Context, dest xnet.Destination, link *transport.Link) error {

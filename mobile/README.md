@@ -21,8 +21,10 @@ supported TLS/REALITY VPN outbounds; put their resolved endpoint IPs in their
 addresses and retain the TLS server names. The core rejects direct fallbacks
 and core-local DNS. When the native network path changes it clears stale
 XHTTP, gRPC and Hysteria clients and resets app flows without tearing down the
-packet tunnel or changing the endpoint. TCP streams that lost their remote
-path still have to reconnect. The monitor uses system events without probes.
+packet tunnel or changing the endpoint. It cancels old flow contexts before
+retiring the transport pools and admitting new flows. TCP streams that lost
+their remote path still have to reconnect. The monitor uses system events
+without probes.
 The bridge only uses public packet flow APIs and keeps a single pending read.
 It delivers each read to Go in batches using one reusable 16 KiB buffer, with
 no timer or wait for additional packets. `inputCalls` counts queue submissions.

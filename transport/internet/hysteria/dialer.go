@@ -70,6 +70,9 @@ func (c *client) close() {
 }
 
 func (c *client) dial(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.forced {
 		return errors.New("client is closed")
 	}
@@ -382,6 +385,9 @@ func ResetMobileNetwork() {
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	if tlsConfig == nil {
 		return nil, errors.New("tls config is nil")
@@ -402,6 +408,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 	if c == nil {
 		manager.Lock()
+		if err := ctx.Err(); err != nil {
+			manager.Unlock()
+			return nil, err
+		}
 		c = manager.m[dialerConfKey]
 		if c == nil {
 			c = &client{

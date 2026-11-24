@@ -34,7 +34,7 @@ type Handler struct {
 	stack           Stack
 	tun             Tun
 	hostDevice      Tun
-	registerReset   func(func())
+	flowReset       flowReset
 	flowMu          sync.Mutex
 	flowCtx         context.Context
 	cancelFlows     context.CancelFunc
@@ -98,7 +98,7 @@ var _ common.Runnable = (*Handler)(nil)
 // Init the Handler instance with necessary parameters
 func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routing.Dispatcher) error {
 	t.hostDevice, _ = ctx.Value(deviceKey{}).(Tun)
-	t.registerReset, _ = ctx.Value(flowsKey{}).(func(func()))
+	t.flowReset, _ = ctx.Value(flowsKey{}).(flowReset)
 	// Retrieve tag and sniffing config from context (set by AlwaysOnInboundHandler)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		t.tag = inbound.Tag
@@ -109,7 +109,7 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 
 	t.ctx, t.cancel = context.WithCancel(core.ToBackgroundDetachedContext(ctx))
 	t.flowCtx = t.ctx
-	if t.registerReset != nil {
+	if t.flowReset.register != nil {
 		t.flowCtx, t.cancelFlows = context.WithCancel(t.ctx)
 	}
 	t.policyManager = pm
@@ -224,12 +224,15 @@ func (t *Handler) Start() error {
 
 	t.stack = tunStack
 	t.tun = tunInterface
-	if t.registerReset != nil {
+	if t.flowReset.register != nil {
 		if resettable, ok := tunStack.(interface{ ResetFlows() }); ok {
-			t.registerReset(func() {
+			t.flowReset.register(func() {
 				t.flowMu.Lock()
 				defer t.flowMu.Unlock()
 				t.cancelFlows()
+				if t.flowReset.retireTransports != nil {
+					t.flowReset.retireTransports()
+				}
 				resettable.ResetFlows()
 				t.flowCtx, t.cancelFlows = context.WithCancel(t.ctx)
 			})
@@ -247,7 +250,7 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	defer conn.Close()
 
 	ctx := t.ctx
-	if t.registerReset != nil {
+	if t.flowReset.register != nil {
 		t.flowMu.Lock()
 		ctx = t.flowCtx
 		t.flowMu.Unlock()

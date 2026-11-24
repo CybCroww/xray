@@ -84,7 +84,7 @@ func start(configJSON string, writer PacketWriter, mtu, memoryLimitMiB int, prot
 	device := newPacketDevice(writer, mtu)
 	var resetFlows func()
 	ctx := tun.ContextWithDevice(context.Background(), device)
-	ctx = tun.ContextWithFlowReset(ctx, func(reset func()) { resetFlows = reset })
+	ctx = tun.ContextWithFlowReset(ctx, func(reset func()) { resetFlows = reset }, resetTransportPaths)
 	ctx, cancel := context.WithCancel(ctx)
 	oldLimit := debug.SetMemoryLimit(-1)
 	limit := min(oldLimit, int64(memoryLimitMiB)<<20)
@@ -199,7 +199,6 @@ func (t *Tunnel) NetworkChanged() {
 		return
 	}
 	t.pathChanges.Add(1)
-	resetTransportPaths()
 	t.resetFlows()
 }
 
@@ -218,8 +217,8 @@ func (t *Tunnel) Stop() error {
 	}
 	t.stopped.Store(true)
 	t.cancel()
-	resetTransportPaths()
 	err := t.instance.Close()
+	resetTransportPaths()
 	t.device.Close()
 	t.instance = nil
 	t.resetFlows = nil

@@ -1,7 +1,9 @@
 package retry_test
 
 import (
+	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -10,6 +12,42 @@ import (
 )
 
 var errorTestOnly = errors.New("this is a fake error")
+
+func TestContextBackoffCancelsPendingRetry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		attempts := 0
+		result := make(chan error, 1)
+		go func() {
+			result <- ExponentialBackoffContext(ctx, 5, 60_000).On(func() error {
+				attempts++
+				return errorTestOnly
+			})
+		}()
+		synctest.Wait()
+		if attempts != 2 {
+			t.Fatalf("started %d attempts before the first delay", attempts)
+		}
+		start := time.Now()
+		cancel()
+		if err := <-result; err != context.Canceled || attempts != 2 || time.Since(start) != 0 {
+			t.Fatalf("retry did not stop immediately: err %v, attempts %d, elapsed %v", err, attempts, time.Since(start))
+		}
+	})
+}
+
+func TestContextBackoffSkipsFinalDelay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		err := ExponentialBackoffContext(context.Background(), 2, 60_000).On(func() error {
+			return errorTestOnly
+		})
+		if errors.Cause(err) != ErrRetryFailed || time.Since(start) != 0 {
+			t.Fatalf("unexpected error or final delay: %v after %v", err, time.Since(start))
+		}
+	})
+}
 
 func TestNoRetry(t *testing.T) {
 	startTime := time.Now().Unix()

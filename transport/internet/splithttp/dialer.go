@@ -54,6 +54,9 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 
 	globalDialerAccess.Lock()
 	defer globalDialerAccess.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if path != nil && path.Err() != nil {
 		return nil, nil, path.Err()
 	}

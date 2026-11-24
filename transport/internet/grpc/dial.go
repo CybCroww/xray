@@ -100,6 +100,9 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
 	globalDialerAccess.Lock()
 	defer globalDialerAccess.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	if globalDialerMap == nil {
 		globalDialerMap = make(map[dialerConf]*grpc.ClientConn)
