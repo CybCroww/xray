@@ -67,6 +67,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	defer conn.Close()
 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", target.Network, ":", c.server.Destination.NetAddr())
 
+	mobileProfile := internet.UsesMobileProfile(ctx)
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
@@ -148,6 +149,9 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			reader := &UDPReader{
 				reader: conn,
 				df:     &Defragger{},
+			}
+			if mobileProfile {
+				reader.df.byteLimit = mobileUDPReassemblyBudget
 			}
 
 			if err := buf.Copy(reader, link.Writer, buf.UpdateActivity(timer)); err != nil {
@@ -251,25 +255,26 @@ func (r *UDPReader) ReadFrom(p []byte) (n int, addr *net.Destination, err error)
 		if err != nil {
 			continue
 		}
-		if msg.FragCount > 1 {
-			msg.Data = append([]byte(nil), msg.Data...)
+		fragmented := msg.FragCount > 1
+		if fragmented {
+			if len(p) == 0 {
+				continue
+			}
+			msg = r.df.feed(msg, p)
 		}
-
-		dfMsg := r.df.Feed(msg)
-		if dfMsg == nil {
+		if msg == nil || len(msg.Data) > len(p) {
 			continue
 		}
 
-		dest, err := net.ParseDestination("udp:" + dfMsg.Addr)
+		dest, err := net.ParseDestination("udp:" + msg.Addr)
 		if err != nil {
 			continue
 		}
 
-		if len(p) < len(dfMsg.Data) {
-			continue
+		if !fragmented {
+			copy(p, msg.Data)
 		}
-
-		return copy(p, dfMsg.Data), &dest, nil
+		return len(msg.Data), &dest, nil
 	}
 }
 

@@ -270,57 +270,119 @@ func FragUDPMessage(m *UDPMessage, maxSize int) []UDPMessage {
 	return frags
 }
 
-// Defragger handles the defragmentation of UDP messages while bounding the
-// number of incomplete packets retained for a connection.
+const mobileUDPReassemblyBudget = 16 * 1024
+
+// Defragger bounds the number of incomplete UDP packets kept for a connection.
 type Defragger struct {
-	slots      [8]fragmentSlot
-	generation uint64
+	slots        [8]fragmentSlot
+	generation   uint64
+	byteLimit    int
+	pendingBytes int
 }
 
 type fragmentSlot struct {
 	pktID     uint16
-	fragCount uint8
-	count     uint8
+	count     int
 	size      int
+	bytes     int
 	lastSeen  uint64
-	fragments []*UDPMessage
+	addr      string
+	fragments [][]byte
 }
 
 func (d *Defragger) Feed(m *UDPMessage) *UDPMessage {
+	return d.feed(m, nil)
+}
+
+// feed assembles into out when supplied. Each retained fragment owns its data,
+// because UDPReader reuses its read buffer for the next fragment.
+func (d *Defragger) feed(m *UDPMessage, out []byte) *UDPMessage {
 	if m.FragCount <= 1 {
 		return m
 	}
-	if m.FragID >= m.FragCount {
-		// wtf is this?
+	if m.FragID >= m.FragCount || len(m.Data) == 0 {
 		return nil
 	}
 
-	d.generation++
 	slot := d.findSlot(m.PacketID)
-	if slot == nil || slot.fragCount != m.FragCount {
-		slot = d.newSlot(m.PacketID, m.FragCount)
+	if slot != nil && (len(slot.fragments) != int(m.FragCount) || slot.addr != m.Addr) {
+		d.release(slot)
+		slot = nil
 	}
-	slot.lastSeen = d.generation
-	if slot.fragments[m.FragID] != nil {
-		return nil
+	limit := int(^uint16(0)) - 8 // Maximum UDP payload with a 16-bit length field.
+	if out != nil {
+		limit = min(limit, len(out))
 	}
-	slot.fragments[m.FragID] = m
-	slot.count++
-	slot.size += len(m.Data)
-	if slot.count != slot.fragCount {
+	size := len(m.Data)
+	if slot != nil {
+		if slot.fragments[m.FragID] != nil {
+			return nil
+		}
+		size += slot.size
+	}
+	if size > limit {
+		if slot != nil {
+			d.release(slot)
+		}
 		return nil
 	}
 
-	data := make([]byte, slot.size)
-	off := 0
-	for _, frag := range slot.fragments {
-		off += copy(data[off:], frag.Data)
+	if slot != nil && slot.count+1 == len(slot.fragments) {
+		if out == nil {
+			out = make([]byte, size)
+		}
+		// The newest fragment can alias out. Move it before writing earlier fragments.
+		offset := 0
+		for _, fragment := range slot.fragments[:m.FragID] {
+			offset += len(fragment)
+		}
+		copy(out[offset:], m.Data)
+		offset = 0
+		for i, fragment := range slot.fragments {
+			if i == int(m.FragID) {
+				offset += len(m.Data)
+			} else {
+				offset += copy(out[offset:], fragment)
+			}
+		}
+		m.Data = out[:size]
+		m.FragID = 0
+		m.FragCount = 1
+		d.release(slot)
+		return m
 	}
-	m.Data = data
-	m.FragID = 0
-	m.FragCount = 1
-	*slot = fragmentSlot{}
-	return m
+
+	extraBytes := len(m.Data)
+	if slot == nil {
+		// Count the retained address and fragment table, using 64-bit slice headers.
+		extraBytes += len(m.Addr) + int(m.FragCount)*24
+	}
+	if d.byteLimit > 0 {
+		if extraBytes > d.byteLimit || (slot != nil && slot.bytes+extraBytes > d.byteLimit) {
+			if slot != nil {
+				d.release(slot)
+			}
+			return nil
+		}
+		for d.pendingBytes+extraBytes > d.byteLimit {
+			d.release(d.oldestSlot(slot))
+		}
+	}
+	if slot == nil {
+		slot = d.newSlot()
+		slot.pktID = m.PacketID
+		slot.addr = m.Addr
+		slot.fragments = make([][]byte, m.FragCount)
+	}
+	d.generation++
+	slot.lastSeen = d.generation
+	slot.fragments[m.FragID] = make([]byte, len(m.Data))
+	copy(slot.fragments[m.FragID], m.Data)
+	slot.count++
+	slot.size = size
+	slot.bytes += extraBytes
+	d.pendingBytes += extraBytes
+	return nil
 }
 
 func (d *Defragger) findSlot(packetID uint16) *fragmentSlot {
@@ -332,23 +394,32 @@ func (d *Defragger) findSlot(packetID uint16) *fragmentSlot {
 	return nil
 }
 
-func (d *Defragger) newSlot(packetID uint16, fragCount uint8) *fragmentSlot {
-	selected := &d.slots[0]
+func (d *Defragger) oldestSlot(exclude *fragmentSlot) *fragmentSlot {
+	var oldest *fragmentSlot
 	for i := range d.slots {
 		slot := &d.slots[i]
-		if slot.fragments == nil {
-			selected = slot
-			break
+		if slot == exclude || slot.fragments == nil {
+			continue
 		}
-		if slot.lastSeen < selected.lastSeen {
-			selected = slot
+		if oldest == nil || slot.lastSeen < oldest.lastSeen {
+			oldest = slot
 		}
 	}
+	return oldest
+}
 
-	*selected = fragmentSlot{
-		pktID:     packetID,
-		fragCount: fragCount,
-		fragments: make([]*UDPMessage, fragCount),
+func (d *Defragger) newSlot() *fragmentSlot {
+	for i := range d.slots {
+		if d.slots[i].fragments == nil {
+			return &d.slots[i]
+		}
 	}
-	return selected
+	slot := d.oldestSlot(nil)
+	d.release(slot)
+	return slot
+}
+
+func (d *Defragger) release(slot *fragmentSlot) {
+	d.pendingBytes -= slot.bytes
+	*slot = fragmentSlot{}
 }

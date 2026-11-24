@@ -1,6 +1,7 @@
 package hysteria
 
 import (
+	"bytes"
 	"io"
 	"testing"
 
@@ -30,22 +31,74 @@ func TestParseUDPMessage(t *testing.T) {
 }
 
 func TestUDPReaderReadFromFragmentedDatagram(t *testing.T) {
-	packets := makeFragmentPackets(t, []byte("hello"), []byte("world"))
-	reader := &UDPReader{
-		reader: &datagramListReader{packets: packets},
-		df:     &Defragger{},
-	}
+	first := bytes.Repeat([]byte{'a'}, 700)
+	second := bytes.Repeat([]byte{'b'}, 400)
+	packets := makeFragmentPackets(t, first, second)
+	want := append(first, second...)
+	for _, order := range []struct {
+		name    string
+		packets [][]byte
+	}{
+		{name: "in order", packets: packets},
+		{name: "reversed", packets: [][]byte{packets[1], packets[0]}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			reader := &UDPReader{
+				reader: &datagramListReader{packets: order.packets},
+				df:     &Defragger{byteLimit: mobileUDPReassemblyBudget},
+			}
 
-	payload := make([]byte, 2048)
-	n, addr, err := reader.ReadFrom(payload)
-	if err != nil {
-		t.Fatal(err)
+			payload := make([]byte, 2048)
+			n, addr, err := reader.ReadFrom(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if addr == nil || addr.NetAddr() != "example.com:53" {
+				t.Fatalf("unexpected destination: %v", addr)
+			}
+			if !bytes.Equal(payload[:n], want) || reader.df.pendingBytes != 0 {
+				t.Fatalf("assembled %d bytes, have %d bytes pending", n, reader.df.pendingBytes)
+			}
+		})
 	}
-	if addr == nil || addr.NetAddr() != "example.com:53" {
-		t.Fatalf("unexpected destination: %v", addr)
+}
+
+func TestUDPReaderDropsFragmentsExceedingOutputCapacity(t *testing.T) {
+	large := makeFragmentPackets(t, bytes.Repeat([]byte{'a'}, 8), bytes.Repeat([]byte{'b'}, 8))
+	small := makeFragmentPackets(t, []byte("abc"), []byte("def"))
+	reader := &UDPReader{
+		reader: &datagramListReader{packets: append(large, small...)},
+		df:     &Defragger{byteLimit: mobileUDPReassemblyBudget},
 	}
-	if got := string(payload[:n]); got != "helloworld" {
-		t.Fatalf("unexpected payload: %q", got)
+	payload := make([]byte, 12)
+	n, _, err := reader.ReadFrom(payload)
+	if err != nil || string(payload[:n]) != "abcdef" || reader.df.pendingBytes != 0 {
+		t.Fatalf("read %q, err = %v, pending bytes = %d", payload[:n], err, reader.df.pendingBytes)
+	}
+}
+
+func TestDefraggerEvictsOldestBeforeExceedingBudget(t *testing.T) {
+	d := &Defragger{byteLimit: 1700}
+	data := bytes.Repeat([]byte{'a'}, 500)
+	for id := uint16(1); id <= 3; id++ {
+		d.Feed(&UDPMessage{PacketID: id, FragCount: 3, Addr: "example.com:53", Data: data})
+	}
+	if d.findSlot(1) != nil || d.findSlot(2) == nil || d.findSlot(3) == nil || d.pendingBytes > d.byteLimit {
+		t.Fatalf("expected packets 2 and 3 to remain, pending bytes = %d", d.pendingBytes)
+	}
+	before := d.pendingBytes
+	d.Feed(&UDPMessage{PacketID: 2, FragCount: 3, Addr: "example.com:53", Data: data})
+	if d.pendingBytes != before {
+		t.Fatalf("duplicate changed pending bytes from %d to %d", before, d.pendingBytes)
+	}
+	d.Feed(&UDPMessage{PacketID: 3, FragID: 1, FragCount: 3, Addr: "example.com:53", Data: bytes.Repeat([]byte{'b'}, 700)})
+	if d.findSlot(2) != nil || d.findSlot(3) == nil || d.pendingBytes > d.byteLimit {
+		t.Fatalf("expected only packet 3 to remain, pending bytes = %d", d.pendingBytes)
+	}
+	last := bytes.Repeat([]byte{'c'}, 500)
+	got := d.Feed(&UDPMessage{PacketID: 3, FragID: 2, FragCount: 3, Addr: "example.com:53", Data: last})
+	if got == nil || len(got.Data) != 1700 || !bytes.HasSuffix(got.Data, last) || d.pendingBytes != 0 {
+		t.Fatalf("packet did not complete correctly, pending bytes = %d", d.pendingBytes)
 	}
 }
 
