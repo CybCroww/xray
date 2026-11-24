@@ -117,6 +117,7 @@ func NewStack(ctx context.Context, options StackOptions, handler ConnectionHandl
 	if options.LowMemory {
 		s.window = 64 << 10
 		s.maxTCP = 96
+		s.fragments.byteLimit = mobileFragmentBytes
 	}
 	for i := range s.identification {
 		s.identification[i].Store(rand.Uint32())
@@ -127,6 +128,7 @@ func NewStack(ctx context.Context, options StackOptions, handler ConnectionHandl
 		if options.LowMemory {
 			s.udp.maxFlows = 64
 			s.udp.queueLimit = 16
+			s.udp.queueBytes = new(udpQueueBudget)
 		}
 	}
 	return s, nil
@@ -147,6 +149,7 @@ func (s *stack) ResetFlows() {
 		conns = append(conns, c)
 	}
 	s.mu.Unlock()
+	s.fragments.reset(false)
 	if s.udp != nil {
 		s.udp.reset(false)
 	}
@@ -170,6 +173,7 @@ func (s *stack) Close() error {
 	sockets := s.sockets
 	s.sockets = nil
 	s.mu.Unlock()
+	s.fragments.reset(true)
 	for _, c := range conns {
 		c.mu.Lock()
 		if c.err == nil {

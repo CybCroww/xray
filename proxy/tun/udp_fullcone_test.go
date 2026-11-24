@@ -90,6 +90,65 @@ func TestPacketQueueDropsDrainedStorage(t *testing.T) {
 	}
 }
 
+func TestMobileUDPQueuesShareByteBudget(t *testing.T) {
+	u := newUdpConnectionHandler(func(net.Conn, net.Destination) {}, nil)
+	u.queueLimit = 16
+	u.queueBytes = new(udpQueueBudget)
+	defer u.closeAll()
+	src := func(i int) net.Destination {
+		return net.UDPDestination(net.ParseAddress("10.0.0.1"), net.Port(1200+i))
+	}
+	dst := net.UDPDestination(net.ParseAddress("10.0.0.2"), 443)
+	large := make([]byte, 60<<10)
+	send := func(source net.Destination, payload []byte) int64 {
+		b := buf.NewWithSize(int32(len(payload)))
+		b.Write(payload)
+		u.HandlePacket(source, dst, b)
+		return int64(b.Cap()) // Zero when HandlePacket dropped and released it.
+	}
+	largeCapacity := send(src(0), large)
+	if largeCapacity == 0 || send(src(0), large) != largeCapacity || send(src(0), large) != 0 {
+		t.Fatal("one flow was not capped by allocated buffer size")
+	}
+	other := net.UDPDestination(net.ParseAddress("10.0.0.2"), 53)
+	dns := []byte("a short datagram")
+	small := buf.NewWithSize(int32(len(dns)))
+	small.Write(dns)
+	u.HandlePacket(src(1), other, small)
+	if small.Cap() == 0 {
+		t.Fatal("one stalled UDP flow prevented a small datagram on another flow")
+	}
+	u.udpConns[src(1)].Close()
+	if used := u.queueBytes.retained.Load(); used != 2*largeCapacity {
+		t.Fatalf("closing a nonempty flow retained budget: %d", used)
+	}
+
+	flowCount := mobileUDPQueueBytes / int(2*largeCapacity)
+	for i := 1; i < flowCount; i++ {
+		if send(src(i), large) != largeCapacity || send(src(i), large) != largeCapacity {
+			t.Fatalf("shared budget rejected flow %d prematurely", i)
+		}
+	}
+	if used := u.queueBytes.retained.Load(); used != mobileUDPQueueBytes {
+		t.Fatalf("expected fully reserved shared budget, got %d", used)
+	}
+	if send(src(flowCount), dns) != 0 || u.udpConns[src(flowCount)] != nil {
+		t.Fatal("full queue budget let a new flow through")
+	}
+	queued, err := u.udpConns[src(0)].ReadMultiBuffer()
+	if err != nil || queued.Len() != int32(len(large)) {
+		t.Fatalf("queued datagram lost or changed: %d bytes, %v", queued.Len(), err)
+	}
+	buf.ReleaseMulti(queued)
+	if send(src(flowCount), dns) == 0 {
+		t.Fatal("dequeue did not make shared budget available")
+	}
+	u.reset(false)
+	if len(u.udpConns) != 0 || u.queueBytes.retained.Load() != 0 {
+		t.Fatal("path reset did not recover the shared UDP budget")
+	}
+}
+
 // A closing stack must end its UDP flows: the dispatch reading a flow gets EOF and returns, instead of
 // waiting on the queue forever and keeping its outbound alive past the instance; a packet that arrives
 // afterwards opens no flow.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -20,6 +21,7 @@ type udpConnectionHandler struct {
 	closed     bool
 	maxFlows   int
 	queueLimit int
+	queueBytes *udpQueueBudget
 
 	handleConnection func(conn net.Conn, dest net.Destination)
 	writePacket      func(data []byte, src net.Destination, dst net.Destination) error
@@ -67,9 +69,14 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 			return
 		}
 		conn = &udpConn{handler: u, queue: newPacketQueue(u.queueLimit), src: src, dst: dst}
+		conn.queue.budget = u.queueBytes
+		if !conn.queue.push(data) {
+			data.Release()
+			return
+		}
 		u.udpConns[src] = conn
-
 		go u.handleConnection(conn, dst)
+		return
 	}
 
 	// queue the packet for the reader of the connection, or discard it
@@ -108,6 +115,7 @@ func (q *packetQueue) discard() {
 		close(q.notify)
 	}
 	for _, packet := range q.items {
+		q.releaseCapacity(packet)
 		packet.Release()
 	}
 	q.items = nil
@@ -118,7 +126,13 @@ func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 	// Close runs twice per flow; a newer conn may already own this src.
 	if u.udpConns[conn.src] == conn {
 		delete(u.udpConns, conn.src)
-		conn.queue.close()
+		if conn.queue.budget != nil {
+			// The dispatcher has finished. Release the shared budget even
+			// when no reader is left to drain its queue.
+			conn.queue.discard()
+		} else {
+			conn.queue.close()
+		}
 	}
 	u.Unlock()
 }
@@ -214,15 +228,35 @@ func (c *udpConn) SetWriteDeadline(t time.Time) error {
 // udpQueueLimit bounds the packets waiting for one UDP flow; more are dropped.
 const udpQueueLimit = 1024
 
+const (
+	mobileUDPQueueBytes   = 2 << 20
+	mobileUDPPerFlowBytes = 256 << 10
+)
+
+type udpQueueBudget struct {
+	retained atomic.Int64
+}
+
+func (b *udpQueueBudget) reserve(size int64) bool {
+	for retained := b.retained.Load(); retained+size <= mobileUDPQueueBytes; retained = b.retained.Load() {
+		if b.retained.CompareAndSwap(retained, retained+size) {
+			return true
+		}
+	}
+	return false
+}
+
 // packetQueue holds the packets waiting for one UDP flow. Unlike a buffered
 // channel of the same bound it only allocates for packets actually queued, so
 // the many idle flows kept until the idle timeout cost next to nothing.
 type packetQueue struct {
-	mu     sync.Mutex
-	items  []*buf.Buffer
-	limit  int
-	notify chan struct{}
-	closed bool
+	mu            sync.Mutex
+	items         []*buf.Buffer
+	limit         int
+	notify        chan struct{}
+	closed        bool
+	budget        *udpQueueBudget
+	retainedBytes int64
 }
 
 func newPacketQueue(limit int) *packetQueue {
@@ -235,6 +269,13 @@ func (q *packetQueue) push(b *buf.Buffer) bool {
 	defer q.mu.Unlock()
 	if q.closed || len(q.items) >= q.limit {
 		return false
+	}
+	if q.budget != nil {
+		size := int64(b.Cap())
+		if q.retainedBytes+size > mobileUDPPerFlowBytes || !q.budget.reserve(size) {
+			return false
+		}
+		q.retainedBytes += size
 	}
 	q.items = append(q.items, b)
 	select {
@@ -250,6 +291,7 @@ func (q *packetQueue) pop() (*buf.Buffer, bool) {
 		q.mu.Lock()
 		if len(q.items) > 0 {
 			b := q.items[0]
+			q.releaseCapacity(b)
 			q.items[0] = nil
 			q.items = q.items[1:]
 			if len(q.items) == 0 {
@@ -264,6 +306,16 @@ func (q *packetQueue) pop() (*buf.Buffer, bool) {
 		}
 		q.mu.Unlock()
 		<-q.notify
+	}
+}
+
+// releaseCapacity returns the queue reservation before giving up the buffer.
+// q.mu is held.
+func (q *packetQueue) releaseCapacity(packet *buf.Buffer) {
+	if q.budget != nil {
+		size := int64(packet.Cap())
+		q.retainedBytes -= size
+		q.budget.retained.Add(-size)
 	}
 }
 

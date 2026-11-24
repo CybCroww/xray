@@ -33,8 +33,9 @@ const (
 	protoFragment      = 44
 	// fragmentsMost is how many packets can be waiting for the rest of their fragments,
 	// fragmentsTime how long they are waited for at most
-	fragmentsMost = 64
-	fragmentsTime = 30 * time.Second
+	fragmentsMost       = 64
+	fragmentsTime       = 30 * time.Second
+	mobileFragmentBytes = 512 << 10
 )
 
 // packet is an IP packet with its header read
@@ -301,8 +302,11 @@ type fragmented struct {
 
 // reassembly puts the packets that come in fragments together
 type reassembly struct {
-	mu      sync.Mutex
-	packets map[fragments]*fragmented
+	mu            sync.Mutex
+	packets       map[fragments]*fragmented
+	retainedBytes int
+	byteLimit     int
+	closed        bool
 }
 
 // fragments is what the fragments of a packet have in common
@@ -310,6 +314,37 @@ type fragments struct {
 	src, dst netip.Addr
 	proto    byte
 	id       uint32
+}
+
+// discard drops a partial packet and its buffer reservation. r.mu is held.
+func (r *reassembly) discard(key fragments, packet *fragmented) {
+	r.retainedBytes -= cap(packet.data)
+	delete(r.packets, key)
+}
+
+// discardOldest makes room without evicting the packet currently growing.
+// r.mu is held.
+func (r *reassembly) discardOldest(keep *fragmented) bool {
+	var oldestKey fragments
+	var oldest *fragmented
+	for key, packet := range r.packets {
+		if packet != keep && (oldest == nil || packet.since.Before(oldest.since)) {
+			oldestKey, oldest = key, packet
+		}
+	}
+	if oldest == nil {
+		return false
+	}
+	r.discard(oldestKey, oldest)
+	return true
+}
+
+func (r *reassembly) reset(closing bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.packets = nil
+	r.retainedBytes = 0
+	r.closed = r.closed || closing
 }
 
 // add takes the fragment p of a packet. With the last one that was missing, it returns the packet.
@@ -327,22 +362,18 @@ func (r *reassembly) add(p packet) (packet, bool) {
 	key, now := fragments{p.src, p.dst, p.proto, p.id}, time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return p, false
+	}
 	f := r.packets[key]
 	if f != nil && now.Sub(f.since) > fragmentsTime {
 		// what is left of a packet whose other fragments were lost: this is one of another packet with its number
+		r.discard(key, f)
 		f = nil
 	}
 	if f == nil {
-		if _, stale := r.packets[key]; !stale && len(r.packets) >= fragmentsMost {
-			// the one that is waited for the longest makes room, not the one that comes now
-			var longest fragments
-			var since time.Time
-			for other, old := range r.packets {
-				if since.IsZero() || old.since.Before(since) {
-					longest, since = other, old.since
-				}
-			}
-			delete(r.packets, longest)
+		if len(r.packets) >= fragmentsMost {
+			r.discardOldest(nil)
 		}
 		if r.packets == nil {
 			r.packets = make(map[fragments]*fragmented)
@@ -357,20 +388,42 @@ func (r *reassembly) add(p packet) (packet, bool) {
 		}
 		if offset < part[1] && part[0] < end {
 			// fragments of one packet do not overlap: these are of two, or made to be taken for something else
-			delete(r.packets, key)
+			r.discard(key, f)
 			return p, false
 		}
 	}
 	if f.known && end > f.size || !p.more && len(f.data) > end {
 		// past its end, or an end before what came
-		delete(r.packets, key)
+		r.discard(key, f)
 		return p, false
 	}
 	if !p.more {
 		f.size, f.known = end, true
 	}
 	if len(f.data) < end {
-		f.data = append(f.data, make([]byte, end-len(f.data))...)
+		oldCapacity := cap(f.data)
+		if r.byteLimit == 0 {
+			f.data = append(f.data, make([]byte, end-len(f.data))...)
+		} else if end <= oldCapacity {
+			f.data = f.data[:end]
+		} else {
+			if end > r.byteLimit {
+				r.discard(key, f)
+				return p, false
+			}
+			capacity := min(most, r.byteLimit, max(end, 2*oldCapacity))
+			growth := capacity - oldCapacity
+			for r.retainedBytes+growth > r.byteLimit {
+				if !r.discardOldest(f) {
+					r.discard(key, f)
+					return p, false
+				}
+			}
+			data := make([]byte, end, capacity)
+			copy(data, f.data)
+			f.data = data
+		}
+		r.retainedBytes += cap(f.data) - oldCapacity
 	}
 	copy(f.data[offset:], fragment)
 	i := 0
@@ -385,7 +438,7 @@ func (r *reassembly) add(p packet) (packet, bool) {
 	if !f.known || f.parts[0] != [2]int{0, f.size} {
 		return p, false
 	}
-	delete(r.packets, key)
+	r.discard(key, f)
 	p.payload, p.fragment = f.data[:f.size], false
 	return p, true
 }
