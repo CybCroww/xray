@@ -69,11 +69,12 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 		uploadQueue: NewUploadQueue(h.ln.config.GetNormalizedScMaxBufferedPosts()),
 	}
 
-	h.sessions.Store(sessionId, s)
 	s.reapTimer = time.AfterFunc(30*time.Second, func() {
-		h.sessions.Delete(sessionId)
-		s.uploadQueue.Close()
+		if h.sessions.CompareAndDelete(sessionId, s) {
+			s.uploadQueue.Close()
+		}
 	})
+	h.sessions.Store(sessionId, s)
 
 	return s
 }
@@ -330,7 +331,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
 			currentSession.reapTimer.Stop()
-			defer h.sessions.Delete(sessionId)
+			defer h.sessions.CompareAndDelete(sessionId, currentSession)
 		}
 
 		// magic header instructs nginx + apache to not buffer response body
