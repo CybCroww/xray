@@ -37,6 +37,9 @@ const (
 	// tcpHeld is how many segments wait for one that was lost before them,
 	// and of how many parts what the system says it has is known
 	tcpHeld = 1024
+	// The mobile stack also caps the payload shared by all reorder queues.
+	mobileTCPHeldSegments = 64
+	mobileTCPHeldBytes    = 1 << 20
 	// tcpSmallest is the smallest mss that the system is believed, the one of Linux
 	tcpSmallest = 48
 	// tcpStamps is what the times of both sides take of the options of every segment that carries them (RFC 7323)
@@ -109,7 +112,7 @@ func nextOption(o []byte) (kind byte, value, rest []byte) {
 // held is a segment that came before the one in front of it
 type held struct {
 	seq  uint32
-	data *buf.Buffer
+	data []byte
 }
 
 // tcpConn is a TCP connection that the system opened through the tun, or one that was opened to it by DialTCP.
@@ -420,7 +423,7 @@ func (c *tcpConn) sendAck() {
 		start, end, recent := c.rcvHeld[i].seq, c.rcvHeld[i].seq, false
 		for ; i < len(c.rcvHeld) && c.rcvHeld[i].seq == end; i++ {
 			recent = recent || end == c.rcvLast
-			end += uint32(c.rcvHeld[i].data.Len())
+			end += uint32(len(c.rcvHeld[i].data))
 		}
 		if recent {
 			blocks[0], last = [2]uint32{start, end}, true
@@ -839,16 +842,23 @@ func (c *tcpConn) receive(s segment) {
 	}
 	c.rcvLen += int32(size)
 	c.rcvNxt += uint32(size)
+	var assembled int64
 	for !fin && len(c.rcvHeld) > 0 && int32(c.rcvNxt-c.rcvHeld[0].seq) >= 0 {
 		h := c.rcvHeld[0]
-		if before := int32(c.rcvNxt - h.seq); before < h.data.Len() {
-			c.rcvQueue = buf.MergeBytes(c.rcvQueue, h.data.BytesFrom(before))
-			c.rcvLen += h.data.Len() - before
-			c.rcvNxt += uint32(h.data.Len() - before)
+		if before := int(c.rcvNxt - h.seq); before < len(h.data) {
+			c.rcvQueue = buf.MergeBytes(c.rcvQueue, h.data[before:])
+			c.rcvLen += int32(len(h.data) - before)
+			c.rcvNxt += uint32(len(h.data) - before)
 		}
-		h.data.Release()
+		assembled += int64(len(h.data))
 		c.rcvHeld[0] = held{}
 		c.rcvHeld = c.rcvHeld[1:]
+	}
+	if len(c.rcvHeld) == 0 {
+		c.rcvHeld = nil
+	}
+	if assembled != 0 && c.stack.tcpHeldLimit != 0 {
+		c.stack.tcpHeldBytes.Add(-assembled)
 	}
 	if fin = fin || c.rcvEnds && c.rcvNxt == c.rcvEnd; fin {
 		c.rcvFin = true
@@ -891,7 +901,7 @@ func (c *tcpConn) hold(seq uint32, payload []byte) {
 	}
 	// without what the one before and the one after have
 	if i > 0 {
-		if over := int32(c.rcvHeld[i-1].seq + uint32(c.rcvHeld[i-1].data.Len()) - seq); over > 0 {
+		if over := int32(c.rcvHeld[i-1].seq + uint32(len(c.rcvHeld[i-1].data)) - seq); over > 0 {
 			if int(over) >= len(payload) {
 				return
 			}
@@ -909,9 +919,12 @@ func (c *tcpConn) hold(seq uint32, payload []byte) {
 	if len(payload) == 0 || len(c.rcvHeld) == tcpHeld {
 		return
 	}
-	// as much memory as it carries: the room that is left counts bytes, and a thousand tiny segments in pooled
-	// buffers would take two megabytes
-	b := buf.FromBytes(slices.Clone(payload))
+	if c.stack.tcpHeldLimit != 0 && (len(c.rcvHeld) >= mobileTCPHeldSegments || !c.stack.reserveTCPHeld(int64(len(payload)))) {
+		return // Do not SACK data the sender will have to retransmit.
+	}
+	// Keep only a copy of the payload. Small segments do not need pooled buffers.
+	b := make([]byte, len(payload))
+	copy(b, payload)
 	c.rcvHeld = slices.Insert(c.rcvHeld, i, held{seq, b})
 	c.rcvLast = seq
 }
@@ -1208,8 +1221,12 @@ func (c *tcpConn) abort(err error) {
 		close(c.opened)
 		c.opened = nil
 	}
-	for _, h := range c.rcvHeld {
-		h.data.Release()
+	if len(c.rcvHeld) != 0 && c.stack.tcpHeldLimit != 0 {
+		var pending int64
+		for _, h := range c.rcvHeld {
+			pending += int64(len(h.data))
+		}
+		c.stack.tcpHeldBytes.Add(-pending)
 	}
 	c.rcvHeld = nil
 	if !c.sending {

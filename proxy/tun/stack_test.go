@@ -537,6 +537,48 @@ func TestTCPOutOfOrder(t *testing.T) {
 	read(t, a.conn, "jklmno")
 }
 
+func TestMobileTCPReorderBudgetPreservesSACK(t *testing.T) {
+	conns := make(chan accepted, 1)
+	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
+	s := newTestStack(t, l, accept(conns))
+	s.tcpHeldLimit = 3 // Keep one segment to exercise the shared cap.
+	p.connect([]byte{2, 4, 5, 0xb4, 4, 2, 0, 0})
+	a := take(t, conns)
+	defer a.conn.Close()
+
+	p.send(p.seq+3, tcpAck, nil, []byte("def"))
+	first := p.receive()
+	if first.ack != p.seq || len(first.options) == 0 || s.tcpHeldBytes.Load() != 3 {
+		t.Fatal("the first segment was not retained and selectively acknowledged")
+	}
+	p.send(p.seq+6, tcpAck, nil, []byte("ghi"))
+	second := p.receive()
+	if second.ack != first.ack || !bytes.Equal(second.options, first.options) || s.tcpHeldBytes.Load() != 3 {
+		t.Fatal("the full queue acknowledged the unstored segment or evicted the earlier one")
+	}
+	p.send(p.seq, tcpAck, nil, []byte("abc"))
+	p.seq += 6
+	if ack := p.receive(); ack.ack != p.seq || s.tcpHeldBytes.Load() != 0 {
+		t.Fatal("filling the gap did not deliver the queued segment and release its budget")
+	}
+	read(t, a.conn, "abcdef")
+	p.send(p.seq, tcpAck, nil, []byte("ghi"))
+	p.seq += 3
+	read(t, a.conn, "ghi")
+
+	p.send(p.seq+3, tcpAck, nil, []byte("mno"))
+	for ack := p.receive(); len(ack.options) == 0; ack = p.receive() {
+		// Skip an ACK for the previous read.
+	}
+	if s.tcpHeldBytes.Load() != 3 {
+		t.Fatal("releasing the budget did not admit the next segment")
+	}
+	s.ResetFlows()
+	if s.tcpHeldBytes.Load() != 0 {
+		t.Fatal("reset retained out-of-order payload")
+	}
+}
+
 // A segment is as large as the system makes it when the tun does not split what it reads, and one that is large,
 // the next and all taken stays in the buffers that such a tun reads it into.
 func TestTCPLargeSegment(t *testing.T) {

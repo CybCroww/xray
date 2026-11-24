@@ -65,6 +65,9 @@ type stack struct {
 	// window is the window of every connection
 	window int32
 	maxTCP int
+	// Limit out-of-order TCP payload across connections on embedded devices.
+	tcpHeldLimit int64
+	tcpHeldBytes atomic.Int64
 	// Schedule TCP work at its deadlines on embedded mobile packet flows.
 	deadlineTimers bool
 	// verify is set if the checksums of what comes are looked at
@@ -119,6 +122,7 @@ func NewStack(ctx context.Context, options StackOptions, handler ConnectionHandl
 	if options.LowMemory {
 		s.window = 64 << 10
 		s.maxTCP = 96
+		s.tcpHeldLimit = mobileTCPHeldBytes
 		s.deadlineTimers = true
 		s.fragments.byteLimit = mobileFragmentBytes
 	}
@@ -135,6 +139,15 @@ func NewStack(ctx context.Context, options StackOptions, handler ConnectionHandl
 		}
 	}
 	return s, nil
+}
+
+func (s *stack) reserveTCPHeld(size int64) bool {
+	for used := s.tcpHeldBytes.Load(); used+size <= s.tcpHeldLimit; used = s.tcpHeldBytes.Load() {
+		if s.tcpHeldBytes.CompareAndSwap(used, used+size) {
+			return true
+		}
+	}
+	return false
 }
 
 // Start is called by Handler to bring stack to life
