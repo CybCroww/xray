@@ -199,8 +199,8 @@ func (d *capturingDispatcher) DispatchLink(ctx context.Context, _ xnet.Destinati
 }
 
 func TestNetworkResetRetiresTransportsBeforeDispatch(t *testing.T) {
-	var reset func()
-	var retired bool
+	var reset func(bool)
+	var retireCount int
 	var previous context.Context
 	dispatcher := &capturingDispatcher{started: make(chan context.Context, 2)}
 	handler := &Handler{
@@ -209,11 +209,11 @@ func TestNetworkResetRetiresTransportsBeforeDispatch(t *testing.T) {
 		dispatcher:    dispatcher,
 		policyManager: policy.DefaultManager{},
 		flowReset: flowReset{
-			register: func(run func()) { reset = run },
+			register: func(run func(bool)) { reset = run },
 		},
 	}
 	handler.flowReset.retireTransports = func() {
-		retired = true
+		retireCount++
 		if previous.Err() != context.Canceled {
 			t.Error("old flow was still live when transport pools began retiring")
 		}
@@ -239,9 +239,28 @@ func TestNetworkResetRetiresTransportsBeforeDispatch(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("first flow did not start")
 	}
-	reset()
-	if !retired {
+	reset(false)
+	if retireCount != 1 {
 		t.Fatal("transport pools were not retired")
+	}
+	discarded := make(chan struct{})
+	go func() {
+		handler.HandleConnection(newTestConn(nil), dest)
+		close(discarded)
+	}()
+	select {
+	case <-discarded:
+	case <-time.After(2 * time.Second):
+		t.Fatal("offline flow did not close")
+	}
+	select {
+	case <-dispatcher.started:
+		t.Fatal("a flow reached the dispatcher while offline")
+	default:
+	}
+	reset(true)
+	if retireCount != 1 {
+		t.Fatal("recovery retired the same transport pools twice")
 	}
 	go handler.HandleConnection(newTestConn(nil), dest)
 	select {

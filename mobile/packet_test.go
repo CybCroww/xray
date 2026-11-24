@@ -79,10 +79,45 @@ func TestPacketBatchRejectsMalformedInputAtomically(t *testing.T) {
 	}
 	for _, tc := range invalid {
 		t.Run(tc.name, func(t *testing.T) {
-			if accepted := device.pushBatch(tc.data, tc.length); accepted != -1 || device.queued() != 0 {
-				t.Fatalf("malformed batch accepted %d, queue size %d", accepted, device.queued())
+			accepted := device.pushBatch(tc.data, tc.length)
+			if queued, _ := device.inputState(); accepted != -1 || queued != 0 {
+				t.Fatalf("malformed batch accepted %d, queue size %d", accepted, queued)
 			}
 		})
+	}
+}
+
+func TestOfflineInputDropsBacklogAndResumes(t *testing.T) {
+	device := newPacketDevice(nil, 1280)
+	defer device.Close()
+	old := make([]byte, 20)
+	if !device.push(old) || !device.pauseInput(true) || device.pauseInput(true) {
+		t.Fatal("first outage did not pause input exactly once")
+	}
+	if count, paused := device.inputState(); !paused || count != 0 {
+		t.Fatalf("input state after outage: %d queued, paused = %t", count, paused)
+	}
+	if device.push(old) {
+		t.Fatal("single input accepted during outage")
+	}
+	batch := appendBatchPacket(nil, old)
+	if got := device.pushBatch(batch, len(batch)); got != 0 {
+		t.Fatalf("batch accepted %d packets during outage", got)
+	}
+	if drops := device.inputDrops.Load(); drops != 3 {
+		t.Fatalf("got %d dropped packets, want 3", drops)
+	}
+	if !device.pauseInput(false) {
+		t.Fatal("input did not resume")
+	}
+	newPacket := make([]byte, 20)
+	newPacket[0] = 42
+	if !device.push(newPacket) {
+		t.Fatal("packet after recovery was rejected")
+	}
+	got, err := device.ReadPacket(make([]byte, 1280))
+	if err != nil || len(got) != 20 || got[0] != 42 {
+		t.Fatalf("first packet after recovery: %x, %v", got, err)
 	}
 }
 

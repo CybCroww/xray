@@ -226,15 +226,19 @@ func (t *Handler) Start() error {
 	t.tun = tunInterface
 	if t.flowReset.register != nil {
 		if resettable, ok := tunStack.(interface{ ResetFlows() }); ok {
-			t.flowReset.register(func() {
+			t.flowReset.register(func(online bool) {
 				t.flowMu.Lock()
 				defer t.flowMu.Unlock()
-				t.cancelFlows()
-				if t.flowReset.retireTransports != nil {
-					t.flowReset.retireTransports()
+				if t.flowCtx.Err() == nil {
+					t.cancelFlows()
+					if t.flowReset.retireTransports != nil {
+						t.flowReset.retireTransports()
+					}
 				}
 				resettable.ResetFlows()
-				t.flowCtx, t.cancelFlows = context.WithCancel(t.ctx)
+				if online {
+					t.flowCtx, t.cancelFlows = context.WithCancel(t.ctx)
+				}
 			})
 		}
 	}
@@ -254,6 +258,9 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 		t.flowMu.Lock()
 		ctx = t.flowCtx
 		t.flowMu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

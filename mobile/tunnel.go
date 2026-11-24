@@ -46,7 +46,7 @@ type Tunnel struct {
 	xhttpFailures uint64
 	lastTrim      atomic.Int64
 	stopped       atomic.Bool
-	resetFlows    func()
+	resetFlows    func(bool)
 	pathChanges   atomic.Uint64
 }
 
@@ -82,9 +82,9 @@ func start(configJSON string, writer PacketWriter, mtu, memoryLimitMiB int, prot
 		return nil, errors.New("a mobile tunnel is already running")
 	}
 	device := newPacketDevice(writer, mtu)
-	var resetFlows func()
+	var resetFlows func(bool)
 	ctx := tun.ContextWithDevice(context.Background(), device)
-	ctx = tun.ContextWithFlowReset(ctx, func(reset func()) { resetFlows = reset }, resetTransportPaths)
+	ctx = tun.ContextWithFlowReset(ctx, func(reset func(bool)) { resetFlows = reset }, resetTransportPaths)
 	ctx, cancel := context.WithCancel(ctx)
 	oldLimit := debug.SetMemoryLimit(-1)
 	limit := min(oldLimit, int64(memoryLimitMiB)<<20)
@@ -183,14 +183,26 @@ func (t *Tunnel) PushPacketBatch(batch []byte, length int) int {
 	return t.device.pushBatch(batch, length)
 }
 
-// RecordInputDrops accounts for invalid packets discarded by the native reader.
+// RecordInputDrops accounts for packets discarded by the native reader.
 func (t *Tunnel) RecordInputDrops(count int) {
 	if count > 0 {
 		t.device.inputDrops.Add(uint64(count))
 	}
 }
 
-// NetworkChanged resets app flows without removing the native VPN routes.
+// NetworkUnavailable discards queued input and cancels old app flows until
+// NetworkChanged is called. The native VPN routes stay installed.
+func (t *Tunnel) NetworkUnavailable() {
+	owner.Lock()
+	defer owner.Unlock()
+	if owner.tunnel != t || t.resetFlows == nil || !t.device.pauseInput(true) {
+		return
+	}
+	t.pathChanges.Add(1)
+	t.resetFlows(false)
+}
+
+// NetworkChanged resets and resumes app flows while keeping native VPN routes.
 // It sends no probes and does not change the selected VPN endpoint.
 func (t *Tunnel) NetworkChanged() {
 	owner.Lock()
@@ -199,7 +211,8 @@ func (t *Tunnel) NetworkChanged() {
 		return
 	}
 	t.pathChanges.Add(1)
-	t.resetFlows()
+	t.resetFlows(true)
+	t.device.pauseInput(false)
 }
 
 func resetTransportPaths() {
@@ -256,8 +269,9 @@ func (t *Tunnel) MemoryStatsJSON() string {
 	}
 	metrics.Read(s[:])
 	requests, bytes, failures := splithttp.MobileUploadStats()
-	return fmt.Sprintf(`{"goManagedBytes":%d,"goHeapBytes":%d,"goTargetBytes":%d,"goroutines":%d,"queuedPackets":%d,"inputCalls":%d,"droppedInputPackets":%d,"droppedOutputPackets":%d,"xhttpUploadRequests":%d,"xhttpUploadPayloadBytes":%d,"xhttpUploadFailures":%d,"networkChanges":%d}`,
+	queued, offline := t.device.inputState()
+	return fmt.Sprintf(`{"goManagedBytes":%d,"goHeapBytes":%d,"goTargetBytes":%d,"goroutines":%d,"queuedPackets":%d,"networkOffline":%t,"inputCalls":%d,"droppedInputPackets":%d,"droppedOutputPackets":%d,"xhttpUploadRequests":%d,"xhttpUploadPayloadBytes":%d,"xhttpUploadFailures":%d,"networkChanges":%d}`,
 		s[0].Value.Uint64()-s[1].Value.Uint64(), s[2].Value.Uint64(), t.limit, s[3].Value.Uint64(),
-		t.device.queued(), t.device.inputCalls.Load(), t.device.inputDrops.Load(), t.device.outputDrops.Load(),
+		queued, offline, t.device.inputCalls.Load(), t.device.inputDrops.Load(), t.device.outputDrops.Load(),
 		requests-t.xhttpRequests, bytes-t.xhttpBytes, failures-t.xhttpFailures, t.pathChanges.Load())
 }

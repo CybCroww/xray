@@ -147,6 +147,10 @@ NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resol
 // gomobile borrows NSMutableData for the synchronous call. Use a fixed buffer
 // so the binding doesn't malloc/copy a separate NSData for every IP packet.
 - (void)pushPackets:(NSArray<NSData *> *)packets {
+    if (_lastPath && nw_path_get_status(_lastPath) == nw_path_status_unsatisfied) {
+        [_tunnel recordInputDrops:(NSInteger)packets.count];
+        return;
+    }
     uint8_t *bytes = _inputBatch.mutableBytes;
     NSUInteger offset = 0;
     NSInteger dropped = 0;
@@ -179,10 +183,16 @@ NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resol
         CVPNPacketFlow *bridge = weakSelf;
         if (!bridge || bridge->_generation != generation || !bridge->_tunnel) return;
         nw_path_t previous = bridge->_lastPath;
+        nw_path_status_t status = nw_path_get_status(path);
+        nw_path_status_t previousStatus = previous ? nw_path_get_status(previous) : nw_path_status_invalid;
+        if (status == nw_path_status_invalid ||
+            (previous && status == previousStatus && nw_path_is_equal(previous, path))) return;
         bridge->_lastPath = path;
-        // Coalesce matching notifications. Reset on recovery or when the
-        // usable route changes. No load is generated while the network is down.
-        if (previous && nw_path_get_status(path) == nw_path_status_satisfied && !nw_path_is_equal(previous, path)) {
+        if (status == nw_path_status_unsatisfied) {
+            [bridge->_tunnel networkUnavailable];
+        } else if (previous && !(previousStatus == nw_path_status_satisfiable && status == nw_path_status_satisfied)) {
+            // A satisfiable path may be activated by the app's first dial.
+            // Preserve those sockets when the path has just become satisfied.
             [bridge->_tunnel networkChanged];
         }
     });

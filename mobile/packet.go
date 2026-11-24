@@ -22,6 +22,7 @@ type packetDevice struct {
 	write       int
 	count       int
 	closed      bool
+	inputPaused bool
 	wake        chan struct{}
 	done        chan struct{}
 	outputMu    sync.Mutex
@@ -115,7 +116,7 @@ func (d *packetDevice) pushBatch(data []byte, length int) int {
 
 // enqueue requires d.mu. Notify only on the transition from empty to nonempty.
 func (d *packetDevice) enqueue(packet []byte) bool {
-	if d.closed || d.count == inputPackets {
+	if d.closed || d.inputPaused || d.count == inputPackets {
 		return false
 	}
 	n := copy(d.data[d.write*d.mtu:], packet)
@@ -131,10 +132,25 @@ func (d *packetDevice) enqueue(packet []byte) bool {
 	return true
 }
 
-func (d *packetDevice) queued() int {
+func (d *packetDevice) inputState() (int, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.count
+	return d.count, d.inputPaused
+}
+
+func (d *packetDevice) pauseInput(paused bool) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed || d.inputPaused == paused {
+		return false
+	}
+	d.inputPaused = paused
+	if paused {
+		d.inputDrops.Add(uint64(d.count))
+		d.read = d.write
+		d.count = 0
+	}
+	return true
 }
 
 func (d *packetDevice) ReadPacket(packet []byte) ([]byte, error) {

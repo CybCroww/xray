@@ -68,7 +68,25 @@ func TestEmbeddedPacketTunnelUDPAndRestart(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatal("no response from the external UDP echo")
 		}
+		tunnel.NetworkUnavailable()
+		tunnel.NetworkUnavailable()
+		if tunnel.PushPacket(makeUDP4(body, uint16(server.LocalAddr().(*net.UDPAddr).Port))) {
+			t.Fatal("packet accepted while network was unavailable")
+		}
+		var status struct {
+			NetworkOffline      bool
+			NetworkChanges      uint64
+			DroppedInputPackets uint64
+		}
+		if err := json.Unmarshal([]byte(tunnel.MemoryStatsJSON()), &status); err != nil ||
+			!status.NetworkOffline || status.NetworkChanges != 1 || status.DroppedInputPackets != 1 {
+			t.Fatalf("unexpected offline state: %+v, %v", status, err)
+		}
 		tunnel.NetworkChanged()
+		if err := json.Unmarshal([]byte(tunnel.MemoryStatsJSON()), &status); err != nil ||
+			status.NetworkOffline || status.NetworkChanges != 2 {
+			t.Fatalf("unexpected recovery state: %+v, %v", status, err)
+		}
 		body[0] += 10
 		batch := appendBatchPacket(nil, makeUDP4(body, uint16(server.LocalAddr().(*net.UDPAddr).Port)))
 		if tunnel.PushPacketBatch(batch, len(batch)) != 1 {

@@ -8,7 +8,7 @@ type (
 )
 
 type flowReset struct {
-	register         func(func())
+	register         func(func(bool))
 	retireTransports func()
 }
 
@@ -18,9 +18,9 @@ func ContextWithDevice(ctx context.Context, device Tun) context.Context {
 	return context.WithValue(ctx, deviceKey{}, device)
 }
 
-// ContextWithFlowReset registers the currently running stack's flow reset
-// with the mobile owner. Transport pools retire between canceling the old
-// dispatch context and admitting new flows. The device and stack stay up.
-func ContextWithFlowReset(ctx context.Context, register func(func()), retireTransports func()) context.Context {
+// ContextWithFlowReset registers the stack's reset with the mobile owner.
+// A reset retires transport pools and new dispatches resume only when the
+// reset function is called with true. The device and stack stay up.
+func ContextWithFlowReset(ctx context.Context, register func(func(bool)), retireTransports func()) context.Context {
 	return context.WithValue(ctx, flowsKey{}, flowReset{register, retireTransports})
 }

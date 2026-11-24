@@ -26,6 +26,10 @@ packet tunnel or changing the endpoint. It cancels old flow contexts before
 retiring the transport pools and admitting new flows. TCP streams that lost
 their remote path still have to reconnect. The monitor uses system events
 without probes.
+When iOS reports an unavailable path, the bridge drains and discards app
+packets while the core cancels old flows. Tunnel routes stay installed and
+new packets are accepted as soon as iOS reports that a path can be used or
+activated by a connection. The diagnostic snapshot exposes `networkOffline`.
 The bridge only uses public packet flow APIs and keeps a single pending read.
 It delivers each read to Go in batches using one reusable 16 KiB buffer, with
 no timer or wait for additional packets. `inputCalls` counts queue submissions.
