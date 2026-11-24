@@ -6,6 +6,8 @@
 #import <os/proc.h>
 #import <sys/socket.h>
 
+static const NSUInteger CVPNInputBatchBytes = 16 * 1024;
+
 void CVPNRequireProtectedRouting(NETunnelProviderProtocol *configuration) {
     configuration.includeAllNetworks = YES;
     configuration.excludeLocalNetworks = NO;
@@ -61,6 +63,8 @@ NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resol
     nw_path_monitor_t _pathMonitor;
     nw_path_t _lastPath;
     CVPNMobileTunnel *_tunnel;
+    NSMutableData *_inputBatch;
+    NSUInteger _mtu;
     BOOL _readPending;
     BOOL _starting;
     uint64_t _generation;
@@ -117,6 +121,8 @@ NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resol
         return;
     }
     self->_tunnel = tunnel;
+    _mtu = (NSUInteger)mtu;
+    _inputBatch = [NSMutableData dataWithLength:CVPNInputBatchBytes];
     [self readNext];
     [self monitorNetwork];
 
@@ -136,6 +142,31 @@ NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resol
         dispatch_resume(source);
     }
     completion(nil);
+}
+
+// gomobile borrows NSMutableData for the synchronous call. Use a fixed buffer
+// so the binding doesn't malloc/copy a separate NSData for every IP packet.
+- (void)pushPackets:(NSArray<NSData *> *)packets {
+    uint8_t *bytes = _inputBatch.mutableBytes;
+    NSUInteger offset = 0;
+    NSInteger dropped = 0;
+    for (NSData *packet in packets) {
+        NSUInteger size = packet.length;
+        if (size < 20 || size > _mtu) {
+            dropped++;
+            continue;
+        }
+        if (offset + 2 + size > CVPNInputBatchBytes) {
+            [_tunnel pushPacketBatch:_inputBatch length:(NSInteger)offset];
+            offset = 0;
+        }
+        bytes[offset] = (uint8_t)(size >> 8);
+        bytes[offset + 1] = (uint8_t)size;
+        [packet getBytes:bytes + offset + 2 length:size];
+        offset += 2 + size;
+    }
+    if (offset) [_tunnel pushPacketBatch:_inputBatch length:(NSInteger)offset];
+    if (dropped) [_tunnel recordInputDrops:dropped];
 }
 
 - (void)monitorNetwork {
@@ -171,7 +202,7 @@ NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resol
             @autoreleasepool {
                 bridge->_readPending = NO;
                 if (generation == bridge->_generation) {
-                    for (NSData *packet in packets) [bridge->_tunnel pushPacket:packet];
+                    [bridge pushPackets:packets];
                 }
                 [bridge readNext];
             }
@@ -194,6 +225,7 @@ NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resol
         }
         [self->_tunnel stop:NULL];
         self->_tunnel = nil;
+        self->_inputBatch = nil;
         completion();
     });
 }

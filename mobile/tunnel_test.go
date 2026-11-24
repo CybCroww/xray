@@ -70,7 +70,8 @@ func TestEmbeddedPacketTunnelUDPAndRestart(t *testing.T) {
 		}
 		tunnel.NetworkChanged()
 		body[0] += 10
-		if !tunnel.PushPacket(makeUDP4(body, uint16(server.LocalAddr().(*net.UDPAddr).Port))) {
+		batch := appendBatchPacket(nil, makeUDP4(body, uint16(server.LocalAddr().(*net.UDPAddr).Port)))
+		if tunnel.PushPacketBatch(batch, len(batch)) != 1 {
 			t.Fatal("packet flow stopped accepting input after path change")
 		}
 		select {

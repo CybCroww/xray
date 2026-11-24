@@ -176,6 +176,20 @@ func startInstance(ctx context.Context, configJSON string, mtu int, protected bo
 // native read callback. false means that the packet was dropped.
 func (t *Tunnel) PushPacket(packet []byte) bool { return t.device.push(packet) }
 
+// PushPacketBatch accepts length bytes of [big-endian uint16 length, IP packet]
+// records. It copies accepted packets before returning. The caller may reuse
+// the buffer immediately. Returns the accepted count, or -1 for invalid framing.
+func (t *Tunnel) PushPacketBatch(batch []byte, length int) int {
+	return t.device.pushBatch(batch, length)
+}
+
+// RecordInputDrops accounts for invalid packets discarded by the native reader.
+func (t *Tunnel) RecordInputDrops(count int) {
+	if count > 0 {
+		t.device.inputDrops.Add(uint64(count))
+	}
+}
+
 // NetworkChanged resets app flows without removing the native VPN routes.
 // It sends no probes and does not change the selected VPN endpoint.
 func (t *Tunnel) NetworkChanged() {
@@ -243,8 +257,8 @@ func (t *Tunnel) MemoryStatsJSON() string {
 	}
 	metrics.Read(s[:])
 	requests, bytes, failures := splithttp.MobileUploadStats()
-	return fmt.Sprintf(`{"goManagedBytes":%d,"goHeapBytes":%d,"goTargetBytes":%d,"goroutines":%d,"queuedPackets":%d,"droppedInputPackets":%d,"droppedOutputPackets":%d,"xhttpUploadRequests":%d,"xhttpUploadPayloadBytes":%d,"xhttpUploadFailures":%d,"networkChanges":%d}`,
+	return fmt.Sprintf(`{"goManagedBytes":%d,"goHeapBytes":%d,"goTargetBytes":%d,"goroutines":%d,"queuedPackets":%d,"inputCalls":%d,"droppedInputPackets":%d,"droppedOutputPackets":%d,"xhttpUploadRequests":%d,"xhttpUploadPayloadBytes":%d,"xhttpUploadFailures":%d,"networkChanges":%d}`,
 		s[0].Value.Uint64()-s[1].Value.Uint64(), s[2].Value.Uint64(), t.limit, s[3].Value.Uint64(),
-		t.device.queued(), t.device.inputDrops.Load(), t.device.outputDrops.Load(),
+		t.device.queued(), t.device.inputCalls.Load(), t.device.inputDrops.Load(), t.device.outputDrops.Load(),
 		requests-t.xhttpRequests, bytes-t.xhttpBytes, failures-t.xhttpFailures, t.pathChanges.Load())
 }

@@ -1,13 +1,17 @@
 package mobile
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
 )
 
-const inputPackets = 128
+const (
+	inputPackets    = 128
+	inputBatchBytes = 16 << 10
+)
 
 type packetDevice struct {
 	mu          sync.Mutex
@@ -25,6 +29,7 @@ type packetDevice struct {
 	output      []byte
 	inputDrops  atomic.Uint64
 	outputDrops atomic.Uint64
+	inputCalls  atomic.Uint64
 }
 
 func newPacketDevice(writer PacketWriter, mtu int) *packetDevice {
@@ -57,19 +62,71 @@ func (d *packetDevice) Close() error {
 }
 
 func (d *packetDevice) push(packet []byte) bool {
+	d.inputCalls.Add(1)
+	if len(packet) < 20 || len(packet) > d.mtu {
+		d.inputDrops.Add(1)
+		return false
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closed || len(packet) < 20 || len(packet) > d.mtu || d.count == inputPackets {
+	if !d.enqueue(packet) {
 		d.inputDrops.Add(1)
+		return false
+	}
+	return true
+}
+
+// pushBatch validates framing before changing the queue. Payload bytes are
+// borrowed only for this call; the ring owns its copies after return.
+func (d *packetDevice) pushBatch(data []byte, length int) int {
+	d.inputCalls.Add(1)
+	if length < 0 || length > len(data) || length > inputBatchBytes {
+		return -1
+	}
+	data = data[:length]
+	for remaining := data; len(remaining) > 0; {
+		if len(remaining) < 2 {
+			return -1
+		}
+		n := int(binary.BigEndian.Uint16(remaining))
+		if n < 20 || n > d.mtu || n > len(remaining)-2 {
+			return -1
+		}
+		remaining = remaining[2+n:]
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	accepted := 0
+	var dropped uint64
+	for len(data) > 0 {
+		n := int(binary.BigEndian.Uint16(data))
+		if d.enqueue(data[2 : 2+n]) {
+			accepted++
+		} else {
+			dropped++
+		}
+		data = data[2+n:]
+	}
+	if dropped != 0 {
+		d.inputDrops.Add(dropped)
+	}
+	return accepted
+}
+
+// enqueue requires d.mu. Notify only on the transition from empty to nonempty.
+func (d *packetDevice) enqueue(packet []byte) bool {
+	if d.closed || d.count == inputPackets {
 		return false
 	}
 	n := copy(d.data[d.write*d.mtu:], packet)
 	d.sizes[d.write] = n
 	d.write = (d.write + 1) % inputPackets
 	d.count++
-	select {
-	case d.wake <- struct{}{}:
-	default:
+	if d.count == 1 {
+		select {
+		case d.wake <- struct{}{}:
+		default:
+		}
 	}
 	return true
 }

@@ -24,6 +24,8 @@ XHTTP, gRPC and Hysteria clients and resets app flows without tearing down the
 packet tunnel or changing the endpoint. TCP streams that lost their remote
 path still have to reconnect. The monitor uses system events without probes.
 The bridge only uses public packet flow APIs and keeps a single pending read.
+It delivers each read to Go in batches using one reusable 16 KiB buffer, with
+no timer or wait for additional packets. `inputCalls` counts queue submissions.
 
 The extension has a 32 MiB Go runtime soft target by default. Packet storage is
 bounded independently of the garbage collector: a 128-packet input ring,
