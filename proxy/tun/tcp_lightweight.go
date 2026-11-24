@@ -1467,6 +1467,22 @@ func (c *tcpConn) Close() error {
 	return nil
 }
 
+// Interrupt abandons a failed upstream flow immediately, including payload
+// that no reader can consume. Ordinary Close still completes the TCP shutdown.
+func (c *tcpConn) Interrupt() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cancelFlow != nil {
+		c.cancelFlow()
+		c.cancelFlow = nil
+	}
+	c.discardUnread()
+	c.rcvFin = false
+	if c.err == nil {
+		c.reset()
+	}
+}
+
 func (c *tcpConn) LocalAddr() net.Addr {
 	return c.dst.RawNetAddr()
 }

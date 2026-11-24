@@ -15,6 +15,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 )
@@ -494,6 +495,35 @@ func TestTCPHandshakeAndClose(t *testing.T) {
 			t.Fatal("not a reset: flags ", s.flags, ", seq ", s.seq)
 		}
 	}
+}
+
+func TestTCPInterruptRetiresFailedUpstream(t *testing.T) {
+	conns := make(chan accepted, 1)
+	p, l := newPeer(t, "10.0.0.1:1234", "10.0.0.2:80")
+	s := newTestStack(t, l, accept(conns))
+	p.connect(nil)
+	a := take(t, conns)
+	c := a.conn.(*tcpConn)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if !c.bindCancel(cancel) {
+		t.Fatal("could not bind the upstream lifetime")
+	}
+	reader := &buf.TimeoutWrapperReader{Reader: &buf.TimeoutWrapperReader{Reader: c}}
+	if err := common.Interrupt(reader); err != nil {
+		t.Fatal(err)
+	}
+	if ack := p.receive(); ack.flags != tcpRst|tcpAck {
+		t.Fatalf("interrupted stream replied with flags %d", ack.flags)
+	}
+	if ctx.Err() != context.Canceled {
+		t.Fatal("interrupt did not cancel the upstream")
+	}
+	if mb, err := reader.ReadMultiBuffer(); !mb.IsEmpty() || err != io.ErrClosedPipe {
+		t.Fatalf("interrupted read returned %v, %v", mb, err)
+	}
+	forgotten(t, s)
+	c.Interrupt()
 }
 
 // What comes after a lost segment is kept and told to the system, and is read once the lost one comes.
