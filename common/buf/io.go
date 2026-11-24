@@ -39,42 +39,49 @@ type TimeoutWrapperReader struct {
 func (r *TimeoutWrapperReader) ReadMultiBuffer() (MultiBuffer, error) {
 	if r.done != nil {
 		<-r.done
-		r.done = nil
-		if r.Counter != nil {
-			r.Counter.Add(int64(r.mb.Len()))
-		}
-		return r.mb, r.err
+		return r.takeResult()
 	}
-	r.mb, r.err = r.Reader.ReadMultiBuffer()
-	if r.Counter != nil {
-		r.Counter.Add(int64(r.mb.Len()))
-	}
-	return r.mb, r.err
+	return r.count(r.Reader.ReadMultiBuffer())
 }
 
 func (r *TimeoutWrapperReader) ReadMultiBufferTimeout(duration time.Duration) (MultiBuffer, error) {
 	if r.done == nil {
-		r.done = make(chan struct{})
+		if reader, ok := r.Reader.(TimeoutReader); ok {
+			mb, err := reader.ReadMultiBufferTimeout(duration)
+			if err == ErrReadTimeout {
+				// The wrapper reports an empty result on timeout.
+				err = nil
+			}
+			return r.count(mb, err)
+		}
+		done := make(chan struct{})
+		r.done = done
 		go func() {
 			r.mb, r.err = r.Reader.ReadMultiBuffer()
-			close(r.done)
+			close(done)
 		}()
 	}
-	timeout := make(chan struct{})
-	go func() {
-		time.Sleep(duration)
-		close(timeout)
-	}()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
 	select {
 	case <-r.done:
-		r.done = nil
-		if r.Counter != nil {
-			r.Counter.Add(int64(r.mb.Len()))
-		}
-		return r.mb, r.err
-	case <-timeout:
+		return r.takeResult()
+	case <-timer.C:
 		return nil, nil
 	}
+}
+
+func (r *TimeoutWrapperReader) takeResult() (MultiBuffer, error) {
+	mb, err := r.mb, r.err
+	r.done, r.mb, r.err = nil, nil, nil
+	return r.count(mb, err)
+}
+
+func (r *TimeoutWrapperReader) count(mb MultiBuffer, err error) (MultiBuffer, error) {
+	if r.Counter != nil {
+		r.Counter.Add(int64(mb.Len()))
+	}
+	return mb, err
 }
 
 // Writer extends io.Writer with MultiBuffer.

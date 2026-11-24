@@ -1222,8 +1222,25 @@ func (c *tcpConn) abort(err error) {
 }
 
 // wait waits for something to read. c.mu is held
-func (c *tcpConn) wait() error {
+func (c *tcpConn) wait(timeout time.Duration, timed bool) error {
+	var timer *time.Timer
+	var deadline time.Time
 	for c.rcvLen == 0 && !c.rcvFin && !c.closed && c.err == nil {
+		if timer != nil && !time.Now().Before(deadline) {
+			return buf.ErrReadTimeout
+		}
+		if timed && timer == nil {
+			if timeout <= 0 {
+				return buf.ErrReadTimeout
+			}
+			deadline = time.Now().Add(timeout)
+			timer = time.AfterFunc(timeout, func() {
+				c.mu.Lock()
+				c.readable.Broadcast()
+				c.mu.Unlock()
+			})
+			defer timer.Stop()
+		}
 		c.readable.Wait()
 	}
 	switch {
@@ -1246,9 +1263,17 @@ func (c *tcpConn) taken(size int32) {
 
 // ReadMultiBuffer implements buf.Reader
 func (c *tcpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	return c.readMultiBuffer(0, false)
+}
+
+func (c *tcpConn) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
+	return c.readMultiBuffer(timeout, true)
+}
+
+func (c *tcpConn) readMultiBuffer(timeout time.Duration, timed bool) (buf.MultiBuffer, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.wait(); err != nil {
+	if err := c.wait(timeout, timed); err != nil {
 		return nil, err
 	}
 	mb := c.rcvQueue
@@ -1261,7 +1286,7 @@ func (c *tcpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
 func (c *tcpConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.wait(); err != nil {
+	if err := c.wait(0, false); err != nil {
 		return 0, err
 	}
 	var n int

@@ -211,6 +211,14 @@ func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	return buf.MultiBuffer{b}, nil
 }
 
+func (c *udpConn) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
+	b, err := c.queue.popUntil(timeout, true)
+	if err != nil {
+		return nil, err
+	}
+	return buf.MultiBuffer{b}, nil
+}
+
 // Read packets from the connection
 func (c *udpConn) Read(p []byte) (int, error) {
 	b, ok := c.queue.pop()
@@ -356,6 +364,12 @@ func (q *packetQueue) push(b *buf.Buffer) bool {
 
 // pop blocks until a packet is queued or the queue is closed and drained.
 func (q *packetQueue) pop() (*buf.Buffer, bool) {
+	b, err := q.popUntil(0, false)
+	return b, err == nil
+}
+
+func (q *packetQueue) popUntil(timeout time.Duration, timed bool) (*buf.Buffer, error) {
+	var deadline <-chan time.Time
 	for {
 		q.mu.Lock()
 		if len(q.items) > 0 {
@@ -367,14 +381,26 @@ func (q *packetQueue) pop() (*buf.Buffer, bool) {
 				q.items = nil
 			}
 			q.mu.Unlock()
-			return b, true
+			return b, nil
 		}
 		if q.closed {
 			q.mu.Unlock()
-			return nil, false
+			return nil, io.EOF
 		}
 		q.mu.Unlock()
-		<-q.notify
+		if timed && deadline == nil {
+			if timeout <= 0 {
+				return nil, buf.ErrReadTimeout
+			}
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			deadline = timer.C
+		}
+		select {
+		case <-q.notify:
+		case <-deadline:
+			return nil, buf.ErrReadTimeout
+		}
 	}
 }
 

@@ -119,6 +119,8 @@ func (p *pipe) ReadMultiBufferTimeout(d time.Duration) (buf.MultiBuffer, error) 
 		select {
 		case <-p.readSignal.Wait():
 		case <-p.done.Wait():
+		case err = <-p.errChan:
+			return nil, err
 		case <-timer.C:
 			return nil, buf.ErrReadTimeout
 		}

@@ -21,6 +21,64 @@ import (
 
 const testMTU = 1500
 
+func TestTUNTimedReadResumesAfterTimeout(t *testing.T) {
+	for _, network := range []string{"tcp", "udp"} {
+		t.Run(network, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var reader buf.TimeoutReader
+				var enqueue func(*buf.Buffer)
+				var finish func()
+				if network == "tcp" {
+					c := &tcpConn{window: 64 << 10, rcvAdvertised: 64 << 10}
+					c.readable.L = &c.mu
+					reader = c
+					enqueue = func(b *buf.Buffer) {
+						c.mu.Lock()
+						c.rcvQueue = append(c.rcvQueue, b)
+						c.rcvLen += b.Len()
+						c.readable.Signal()
+						c.mu.Unlock()
+					}
+					finish = func() {
+						c.mu.Lock()
+						c.rcvFin = true
+						c.readable.Broadcast()
+						c.mu.Unlock()
+					}
+				} else {
+					q := newPacketQueue(1)
+					reader = &udpConn{queue: q}
+					enqueue = func(b *buf.Buffer) { q.push(b) }
+					finish = q.close
+				}
+				if mb, err := reader.ReadMultiBufferTimeout(time.Second); !mb.IsEmpty() || err != buf.ErrReadTimeout {
+					t.Fatalf("empty reader returned %v, %v", mb, err)
+				}
+				wrapped := &buf.TimeoutWrapperReader{Reader: &buf.TimeoutWrapperReader{Reader: reader}}
+				if mb, err := wrapped.ReadMultiBufferTimeout(0); !mb.IsEmpty() || err != nil {
+					t.Fatalf("wrapped timeout returned %v, %v", mb, err)
+				}
+				go func() {
+					time.Sleep(time.Second)
+					enqueue(buf.FromBytes([]byte("payload")))
+				}()
+				mb, err := wrapped.ReadMultiBufferTimeout(2 * time.Second)
+				defer buf.ReleaseMulti(mb)
+				if err != nil || mb.String() != "payload" {
+					t.Fatalf("late payload returned %q, %v", mb.String(), err)
+				}
+				go func() {
+					time.Sleep(time.Second)
+					finish()
+				}()
+				if mb, err := wrapped.ReadMultiBufferTimeout(2 * time.Second); !mb.IsEmpty() || err != io.EOF {
+					t.Fatalf("closed reader returned %v, %v", mb, err)
+				}
+			})
+		})
+	}
+}
+
 // link is a tun with the test on its other side
 type link struct {
 	// in is what the stack reads
