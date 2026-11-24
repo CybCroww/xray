@@ -20,7 +20,10 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Test client and packet flow
-        run: go test -race ./mobile ./transport/internet/splithttp ./proxy/tun
+        run: >
+          go test -race ./mobile ./proxy/tun
+          ./transport/internet/grpc/... ./transport/internet/hysteria
+          ./transport/internet/splithttp ./transport/internet/tcp ./transport/internet/websocket
       - name: Build iPhone and simulator framework
         run: |
           bash mobile/ios/build.sh
