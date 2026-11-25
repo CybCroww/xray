@@ -1,10 +1,12 @@
 #import "CVPNPacketFlow.h"
+#import "CVPNPathPolicy.h"
 #import <CVPNCore/CVPNCore.h>
 #import <Network/Network.h>
 #import <arpa/inet.h>
 #import <mach/mach.h>
 #import <os/proc.h>
 #import <sys/socket.h>
+#import <string.h>
 
 static const NSUInteger CVPNInputBatchBytes = 16 * 1024;
 
@@ -55,6 +57,30 @@ NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resol
 }
 @end
 
+// Ignore resolver, cost and virtual tunnel metadata changes. They do not
+// invalidate the physical sockets used by the protected core.
+static NSString *CVPNPhysicalPath(nw_path_t path) {
+    NSMutableArray<NSString *> *interfaces = [NSMutableArray array];
+    nw_path_enumerate_interfaces(path, ^bool(nw_interface_t interface) {
+        const char *name = nw_interface_get_name(interface);
+        if (name && strncmp(name, "utun", 4) != 0 && strncmp(name, "lo", 2) != 0) {
+            [interfaces addObject:[NSString stringWithFormat:@"%d:%s", (int)nw_interface_get_type(interface), name]];
+        }
+        return true;
+    });
+    nw_path_enumerate_gateways(path, ^bool(nw_endpoint_t gateway) {
+        const char *address = nw_endpoint_get_hostname(gateway);
+        if (address) [interfaces addObject:[NSString stringWithFormat:@"gateway:%s", address]];
+        return true;
+    });
+    nw_endpoint_t local = nw_path_copy_effective_local_endpoint(path);
+    const char *address = local ? nw_endpoint_get_hostname(local) : NULL;
+    if (address) [interfaces addObject:[NSString stringWithFormat:@"local:%s", address]];
+    [interfaces sortUsingSelector:@selector(compare:)];
+    return [NSString stringWithFormat:@"%d:%d:%@", nw_path_has_ipv4(path), nw_path_has_ipv6(path),
+        [interfaces componentsJoinedByString:@","]];
+}
+
 @implementation CVPNPacketFlow {
     __weak NEPacketTunnelProvider *_provider;
     NEPacketTunnelFlow *_flow;
@@ -62,6 +88,9 @@ NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resol
     dispatch_source_t _memoryPressure;
     nw_path_monitor_t _pathMonitor;
     nw_path_t _lastPath;
+    NSString *_physicalPath;
+    void (^_eventHandler)(NSString *);
+    BOOL _sleeping;
     CVPNMobileTunnel *_tunnel;
     NSMutableData *_inputBatch;
     NSUInteger _mtu;
@@ -185,18 +214,49 @@ NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resol
         nw_path_t previous = bridge->_lastPath;
         nw_path_status_t status = nw_path_get_status(path);
         nw_path_status_t previousStatus = previous ? nw_path_get_status(previous) : nw_path_status_invalid;
-        if (status == nw_path_status_invalid ||
-            (previous && status == previousStatus && nw_path_is_equal(previous, path))) return;
+        if (status == nw_path_status_invalid) return;
+        NSString *physical = CVPNPhysicalPath(path);
+        BOOL samePhysical = [physical isEqualToString:bridge->_physicalPath];
         bridge->_lastPath = path;
-        if (status == nw_path_status_unsatisfied) {
+        bridge->_physicalPath = physical;
+        CVPNPathAction action = CVPNDecidePath(previous != nil,
+            previousStatus == nw_path_status_unsatisfied, status == nw_path_status_unsatisfied,
+            previousStatus == nw_path_status_satisfiable && status == nw_path_status_satisfied,
+            samePhysical);
+        if (action == CVPNPathPause) {
+            if (bridge->_eventHandler) bridge->_eventHandler(@"Сеть недоступна: потоки приостановлены");
             [bridge->_tunnel networkUnavailable];
-        } else if (previous && !(previousStatus == nw_path_status_satisfiable && status == nw_path_status_satisfied)) {
-            // A satisfiable path may be activated by the app's first dial.
-            // Preserve those sockets when the path has just become satisfied.
+        } else if (action == CVPNPathReset) {
+            if (bridge->_eventHandler) bridge->_eventHandler(@"Физический маршрут изменён: соединения обновлены");
             [bridge->_tunnel networkChanged];
         }
     });
     nw_path_monitor_start(_pathMonitor);
+}
+
+- (void)setEventHandler:(void (^)(NSString *))handler {
+    dispatch_async(_queue, ^{ self->_eventHandler = [handler copy]; });
+}
+
+- (void)sleepWithCompletion:(dispatch_block_t)completion {
+    dispatch_async(_queue, ^{
+        self->_sleeping = self->_tunnel != nil;
+        if (self->_sleeping && self->_eventHandler) self->_eventHandler(@"Сон сетевого расширения");
+        completion();
+    });
+}
+
+- (void)wake {
+    dispatch_async(_queue, ^{
+        if (!self->_sleeping) return;
+        self->_sleeping = NO;
+        // An unchanged route does not mean that NAT/TCP state survived sleep.
+        // Retire all transport pools together; native protected routes stay up.
+        if (self->_tunnel && (!self->_lastPath || nw_path_get_status(self->_lastPath) != nw_path_status_unsatisfied)) {
+            if (self->_eventHandler) self->_eventHandler(@"Пробуждение: соединения обновлены");
+            [self->_tunnel networkChanged];
+        }
+    });
 }
 
 - (void)readNext {
@@ -229,6 +289,9 @@ NEPacketTunnelNetworkSettings *CVPNFullTunnelSettings(NSArray<NSString *> *resol
             self->_pathMonitor = nil;
         }
         self->_lastPath = nil;
+        self->_physicalPath = nil;
+        self->_sleeping = NO;
+        self->_eventHandler = nil;
         if (self->_memoryPressure) {
             dispatch_source_cancel(self->_memoryPressure);
             self->_memoryPressure = nil;

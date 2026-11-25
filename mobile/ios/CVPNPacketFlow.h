@@ -20,6 +20,9 @@ FOUNDATION_EXPORT NEPacketTunnelNetworkSettings *_Nullable CVPNFullTunnelSetting
                    mtu:(NSInteger)mtu
              resolverIPs:(NSArray<NSString *> *)resolverIPs
              completion:(void (^)(NSError *_Nullable))completion;
+- (void)setEventHandler:(void (^)(NSString *))handler;
+- (void)sleepWithCompletion:(dispatch_block_t)completion;
+- (void)wake;
 - (void)stopWithCompletion:(dispatch_block_t)completion;
 - (void)takeMemorySnapshot:(void (^)(NSDictionary<NSString *, NSNumber *> *))completion;
 @end

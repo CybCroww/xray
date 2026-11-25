@@ -148,6 +148,69 @@ func TestMobileGRPCTrimKeepsLiveStreams(t *testing.T) {
 	}
 }
 
+// A path notification can arrive while HTTP/2 is still waiting for its
+// server preface. Retiring that channel must release the dial and allow a
+// fresh channel to connect, rather than poisoning the shared pool.
+func TestMobileGRPCResetDuringServerPreface(t *testing.T) {
+	t.Cleanup(ResetMobileNetwork)
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+	settings := &internet.MemoryStreamConfig{ProtocolName: protocolName, ProtocolSettings: &Config{}}
+	dest := net.TCPDestination(net.LocalHostIP, net.Port(listener.Addr().(*net.TCPAddr).Port))
+	failed := make(chan error, 1)
+	go func() {
+		conn, err := dialgRPC(ctx, dest, settings, true)
+		if conn != nil {
+			conn.Close()
+		}
+		failed <- err
+	}()
+	select {
+	case conn := <-accepted:
+		defer conn.Close()
+	case <-ctx.Done():
+		t.Fatal("dial never reached listener")
+	}
+	ResetMobileNetwork()
+	select {
+	case err := <-failed:
+		if err == nil {
+			t.Fatal("interrupted preface unexpectedly succeeded")
+		}
+	case <-ctx.Done():
+		t.Fatal("interrupted preface remained blocked")
+	}
+	server := grpc.NewServer()
+	defer server.Stop()
+	cfg := settings.ProtocolSettings.(*Config)
+	encoding.RegisterGRPCServiceServerX(server, echoTunnelServer{}, cfg.getServiceName(), cfg.getTunStreamName(), cfg.getTunMultiStreamName())
+	go server.Serve(listener)
+	conn, err := dialgRPC(ctx, dest, settings, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "after reset"); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, len("after reset"))
+	if _, err := io.ReadFull(conn, response); err != nil || string(response) != "after reset" {
+		t.Fatalf("fresh channel failed: %q, %v", response, err)
+	}
+}
+
 type largeResponseServer struct {
 	encoding.UnimplementedGRPCServiceServer
 	payload []byte
